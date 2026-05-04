@@ -67,7 +67,7 @@ If you've done all five, an attacker needs to compromise multiple independent la
 - [ ] You can reach the **cloud-provider web console** (Contabo VPS Control, AWS Console, Hetzner Robot, etc.) and have logged in once recently.
 - [ ] You know the password for that console account.
 - [ ] You know the **root password** OR have console-mounted recovery (Contabo: Web Console; AWS: SSM Session Manager / EC2 Instance Connect).
-- [ ] You have **two open SSH sessions** when changing sshd config — one to apply, one as a safety net.
+- [ ] You have **at least two open SSH sessions** when changing sshd config — one to apply changes, one as a safety net. The custom-port step (§5.3) requires a third to test the new port while keeping both existing sessions open.
 - [ ] You've run `sudo sshd -t` to validate config syntax **before** restarting sshd.
 - [ ] Backup `/etc/ssh/`, `/etc/sudoers`, `/etc/sudoers.d/`, and `/etc/pam.d/sshd`:
   ```
@@ -97,11 +97,15 @@ flowchart TD
     UFW --> P80["Port 80 / 443\n→ Traefik reverse proxy"]
     UFW --> TS["Tailscale tailnet\n→ SSH · Adminer · internal admin"]
     UFW --> DROP["All other ports\nDROP"]
-    P80 --> TLS["TLS + service auth on apps"]
+    P80 --> APPS["Web apps / services"]
     TS --> SSH["SSH\nkeys + TOTP + custom port\n(Layers 2–3)"]
-    TLS --> AA["AppArmor confinement\nsysctl hardened\nunattended-upgrades\n(Layer 4)"]
-    SSH --> AA
-    AA --> DK["Docker isolation\nno exposed socket\n(Layer 5)"]
+
+    subgraph HOST["Layers 4–5 — AppArmor · sysctl · unattended-upgrades wrap all processes below"]
+        APPS
+        SSH
+        APPS --> DK["Docker containers\nno exposed socket\n(Layer 5)"]
+        SSH --> DK
+    end
 ```
 
 The principle: **no single misconfiguration should expose the whole box.**
@@ -211,12 +215,16 @@ Configure: deny all incoming except 80, 443, and your SSH port. For private over
 curl -fsSL https://tailscale.com/install.sh | sh
 sudo tailscale up
 # You'll get a URL — authenticate the device against your Tailscale account.
+
+# Ensure tailscaled starts automatically on boot:
+sudo systemctl enable tailscaled
 ```
 
 **Verify:**
 ```bash
 tailscale status
 tailscale ip -4               # e.g. 100.119.243.22
+systemctl is-enabled tailscaled   # must be "enabled" — critical for §7.6
 ```
 
 From a tailnet peer (your laptop), ping the VPS by its tailscale name: `ping vps-myhost`.
@@ -265,7 +273,7 @@ sudo ufw status verbose
 
 ## 5. Phase 3 — SSH hardening
 
-*Harden SSH access. Use two open sessions and run `sshd -t` before every restart.*
+*Harden SSH access. Use at least two open sessions and run `sshd -t` before every restart.*
 
 ### 5.1 SSH key authentication
 
@@ -322,7 +330,7 @@ sudo ufw allow 45097/tcp
 # 2. Change the port in the sshd drop-in
 echo "Port 45097" | sudo tee -a /etc/ssh/sshd_config.d/99-local.conf
 
-# 3. Validate + restart (keep TWO sessions open — see §1)
+# 3. Validate + restart (keep at least TWO sessions open — see §1)
 sudo sshd -t && sudo systemctl restart ssh
 
 # 4. From a THIRD terminal, open a new session on the new port
@@ -353,10 +361,15 @@ sudo ufw status verbose     # 22 gone, 45097 present
 PermitRootLogin no
 ```
 
+Then validate and restart:
+```bash
+sudo sshd -t && sudo systemctl restart ssh
+```
+
 **Verify:**
 ```bash
-sudo sshd -T | grep permitroot
-ssh -p 45097 root@vps    # should fail
+sudo sshd -T | grep permitroot    # permitrootlogin no
+ssh -p 45097 root@vps             # should fail
 ```
 
 ### 5.5 Restrict to specific users (AllowUsers)
@@ -371,10 +384,15 @@ AllowUsers glenbenatiro
 # AllowGroups ssh-users    # alternative for multi-admin setups
 ```
 
+Then validate and restart:
+```bash
+sudo sshd -t && sudo systemctl restart ssh
+```
+
 **Verify:**
 ```bash
-sudo sshd -T | grep -i allowusers
-ssh -p 45097 nobody@vps    # should fail with "Permission denied"
+sudo sshd -T | grep -i allowusers    # allowusers glenbenatiro
+ssh -p 45097 nobody@vps              # should fail with "Permission denied"
 ```
 
 ---
@@ -382,6 +400,8 @@ ssh -p 45097 nobody@vps    # should fail with "Permission denied"
 ## 6. Phase 4 — Two-factor authentication (TOTP)
 
 *Add a phone-based second factor. After this phase, login requires key + passphrase + TOTP code.*
+
+**Keep at least two SSH sessions open during this phase** — sshd restarts are required and you need a safety net if the PAM config is wrong.
 
 ### 6.1 TOTP via PAM (Google Authenticator / Aegis / 1Password)
 
@@ -404,15 +424,14 @@ google-authenticator
 #   - window?          yes
 # Scan the QR with your authenticator app. SAVE THE RECOVERY CODES in your password manager.
 
-# 3. Enable TOTP in PAM — add as the FIRST line of /etc/pam.d/sshd:
-#   auth required pam_google_authenticator.so
-# Edit with:
-sudo sed -i '1s/^/auth required pam_google_authenticator.so\n/' /etc/pam.d/sshd
+# 3. Enable TOTP in PAM — insert AFTER @include common-auth in /etc/pam.d/sshd
+#    The guard prevents double-insertion if you re-run this step.
+grep -q 'pam_google_authenticator' /etc/pam.d/sshd || \
+  sudo sed -i '/^@include common-auth/a auth required pam_google_authenticator.so' /etc/pam.d/sshd
 
 # 4. Configure sshd to invoke PAM keyboard-interactive
 sudo tee -a /etc/ssh/sshd_config.d/99-local.conf <<'EOF'
 KbdInteractiveAuthentication yes
-ChallengeResponseAuthentication yes
 UsePAM yes
 EOF
 
@@ -424,6 +443,10 @@ sudo sshd -t && sudo systemctl restart ssh
 ```
 sshd(pam_google_authenticator)[...]: Accepted google_authenticator for <user>
 sshd[...]: Accepted keyboard-interactive/pam for <user> ...
+```
+Check the log directly:
+```bash
+sudo grep 'google_authenticator\|keyboard-interactive' /var/log/auth.log | tail -5
 ```
 
 **Recovery codes:** When you ran `google-authenticator`, it gave 5 emergency scratch codes. Each is single-use. Losing your phone without them means losing SSH access — use the cloud console to disable TOTP (`mv ~/.google_authenticator ~/.google_authenticator.disabled`).
@@ -495,17 +518,39 @@ ssh -p 45097 vps             # should connect
 MaxAuthTries 3
 ```
 
+Then validate and restart:
+```bash
+sudo sshd -t && sudo systemctl restart ssh
+```
+
+**Verify:**
+```bash
+sudo sshd -T | grep maxauthtries    # maxauthtries 3
+```
+
 ### 7.3 ClientAliveInterval / ClientAliveCountMax
 
 **What:** Server-side keepalive. Disconnects unresponsive sessions after a timeout.
 
 **Why it protects:** Stale sessions left open on a compromised laptop are a forever-open back door. A 10-minute unresponsive timeout cleans them up.
 
-**How:**
+**How:** Add to `/etc/ssh/sshd_config.d/99-local.conf`:
 ```
 ClientAliveInterval 300
 ClientAliveCountMax 2
 # → disconnects after ~10 min of an unresponsive client
+```
+
+Then validate and restart:
+```bash
+sudo sshd -t && sudo systemctl restart ssh
+```
+
+**Verify:**
+```bash
+sudo sshd -T | grep -i clientalive
+# clientaliveinterval 300
+# clientalivecountmax 2
 ```
 
 ### 7.4 Disable X11 forwarding
@@ -514,12 +559,22 @@ ClientAliveCountMax 2
 
 **Why it protects:** Reduces what a compromised SSH session can do — e.g. tunnelling traffic from the server to arbitrary internal hosts.
 
-**How:**
+**How:** Add to `/etc/ssh/sshd_config.d/99-local.conf`:
 ```
 X11Forwarding no
 # Only set these to 'no' if you DON'T use SSH tunnelling:
 # AllowTcpForwarding no
 # AllowAgentForwarding no
+```
+
+Then validate and restart:
+```bash
+sudo sshd -t && sudo systemctl restart ssh
+```
+
+**Verify:**
+```bash
+sudo sshd -T | grep x11forwarding    # x11forwarding no
 ```
 
 **Note:** If you tunnel internal services (e.g. `ssh -L 5432:127.0.0.1:5432 vps` to access a containerised Postgres), keep `AllowTcpForwarding yes`.
@@ -541,6 +596,11 @@ MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@op
 PubkeyAcceptedAlgorithms ssh-ed25519,ssh-ed25519-cert-v01@openssh.com,sk-ssh-ed25519@openssh.com,sk-ssh-ed25519-cert-v01@openssh.com,rsa-sha2-512,rsa-sha2-256
 ```
 
+Then validate and restart:
+```bash
+sudo sshd -t && sudo systemctl restart ssh
+```
+
 **Verify (from a tailnet peer or your laptop):**
 ```bash
 pipx install ssh-audit
@@ -558,6 +618,17 @@ ssh-audit -p 45097 <vps-ip>
 
 **Why it protects:** Belt + braces. Even if UFW is accidentally disabled, sshd is invisible to anything not on the tailnet.
 
+**Critical caveat — highest lockout risk in this guide:** If Tailscale fails to start after a reboot and sshd is bound to its IP, SSH is completely unavailable. The cloud console is your **only** recovery path. Before proceeding:
+
+1. Confirm `tailscaled` is enabled at boot and has survived at least one reboot:
+   ```bash
+   systemctl is-enabled tailscaled    # must be "enabled"
+   tailscale status                   # must be "Running"
+   ```
+2. If you haven't rebooted since installing Tailscale, do so now and confirm it comes back before continuing.
+3. Have your cloud-provider console open and ready.
+4. Keep at least two SSH sessions open while applying this step.
+
 **How:**
 ```bash
 TS4=$(tailscale ip -4)
@@ -574,11 +645,10 @@ sudo sshd -t && sudo systemctl restart ssh
 ```bash
 sudo ss -tlnp | grep ssh
 # Should show LISTEN only on Tailscale IPs, NOT on 0.0.0.0
-nc -vz <public-ip> 45097    # should time out
-nc -vz 100.x.x.x 45097     # should connect
-```
 
-**Critical caveat:** Only do this **after** Tailscale is confirmed working and persistent across reboots. If Tailscale fails to start, you've lost SSH entirely. The cloud console is the only recovery path. Always test with a second open SSH session before closing the first.
+nc -vz <public-ip> 45097     # should time out
+nc -vz 100.x.x.x 45097      # should connect (from tailnet peer)
+```
 
 ---
 
@@ -606,11 +676,14 @@ Unattended-Upgrade::Automatic-Reboot-Time "04:00";
 EOF
 ```
 
+**Note:** `Automatic-Reboot-WithUsers "true"` means the VPS **will reboot at 04:00 even with active sessions**. Any open `tmux`/`screen` sessions or running scripts will be killed. If you need to prevent this during specific windows, temporarily set it to `"false"` and re-enable afterward.
+
 **Verify:**
 ```bash
 systemctl is-active unattended-upgrades        # active
 systemctl is-enabled unattended-upgrades       # enabled
 sudo unattended-upgrades --dry-run --debug | tail -20
+grep 'Automatic-Reboot' /etc/apt/apt.conf.d/50unattended-upgrades
 ls /var/run/reboot-required 2>&1               # should not exist after auto-reboot
 ```
 
@@ -677,8 +750,10 @@ sudo sysctl --system
 
 **Verify:**
 ```bash
-sudo sysctl net.ipv4.tcp_syncookies net.ipv4.conf.all.rp_filter \
-  net.ipv4.conf.all.send_redirects net.ipv4.conf.all.log_martians
+sysctl net.ipv4.tcp_syncookies net.ipv4.conf.all.rp_filter \
+  net.ipv4.conf.all.send_redirects net.ipv4.conf.all.log_martians \
+  net.ipv4.conf.all.accept_redirects net.ipv4.conf.all.accept_source_route
+# All should show the hardened values set above.
 ```
 
 ### 8.4 Sysctl: filesystem hardening
@@ -705,6 +780,17 @@ EOF
 sudo sysctl --system
 ```
 
+**Verify:**
+```bash
+sysctl fs.protected_hardlinks fs.protected_symlinks \
+  fs.protected_fifos fs.protected_regular fs.suid_dumpable
+# fs.protected_hardlinks = 1
+# fs.protected_symlinks = 1
+# fs.protected_fifos = 1
+# fs.protected_regular = 1
+# fs.suid_dumpable = 0
+```
+
 ### 8.5 Sysctl: kernel info-leak hardening
 
 **What:** Hide kernel addresses and diagnostics from unprivileged users.
@@ -715,7 +801,7 @@ sudo sysctl --system
 |---|---|---|
 | `kernel.kptr_restrict = 2` | Hide kernel pointers everywhere | Prevents address leaks for KASLR bypass |
 | `kernel.dmesg_restrict = 1` | dmesg requires root | dmesg can leak addresses and hardware info |
-| `kernel.unprivileged_bpf_disabled = 2` | Disable unprivileged BPF | Removes a major kernel-attack surface |
+| `kernel.unprivileged_bpf_disabled = 2` | Disable unprivileged BPF (locked) | Removes a major kernel-attack surface; value 2 = cannot be changed even by root at runtime |
 | `net.core.bpf_jit_harden = 2` | Harden BPF JIT | Defence against JIT-spray attacks |
 | `kernel.randomize_va_space = 2` | Full ASLR | Already default on Ubuntu; confirm it's set |
 
@@ -729,6 +815,18 @@ net.core.bpf_jit_harden = 2
 kernel.randomize_va_space = 2
 EOF
 sudo sysctl --system
+```
+
+**Verify:**
+```bash
+sysctl kernel.kptr_restrict kernel.dmesg_restrict \
+  kernel.unprivileged_bpf_disabled net.core.bpf_jit_harden \
+  kernel.randomize_va_space
+# kernel.kptr_restrict = 2
+# kernel.dmesg_restrict = 1
+# kernel.unprivileged_bpf_disabled = 2
+# net.core.bpf_jit_harden = 2
+# kernel.randomize_va_space = 2
 ```
 
 ### 8.6 Lock the root password
@@ -785,6 +883,12 @@ sudo cat /etc/sudoers.d/*
 # If you see `your_user ALL=(ALL) NOPASSWD:ALL`, edit it out via visudo.
 ```
 
+**Verify:**
+```bash
+sudo grep -E '^Defaults' /etc/sudoers         # env_reset, secure_path, use_pty present
+sudo grep -r 'NOPASSWD' /etc/sudoers.d/       # should be empty or expected entries only
+```
+
 ---
 
 ## 9. Phase 7 — Intrusion detection & monitoring
@@ -825,9 +929,10 @@ sudo systemctl enable --now fail2ban
 
 **Verify:**
 ```bash
-sudo fail2ban-client status
-sudo fail2ban-client status sshd
-sudo fail2ban-client status recidive
+sudo systemctl is-active fail2ban      # active
+sudo fail2ban-client status            # lists active jails
+sudo fail2ban-client status sshd       # sshd jail running
+sudo fail2ban-client status recidive   # recidive jail running
 ```
 
 **Note:** If sshd is invisible to the public (UFW + Tailscale-only from Phase 5), fail2ban will have nothing to ban on sshd — which is exactly right. It still earns its place on any public-facing service (HTTP auth, mail, etc.).
@@ -846,6 +951,8 @@ sudo grep -E 'Accepted|Failed|Invalid' /var/log/auth.log | tail -100
 ```
 
 Build a habit: check these monthly, after returning from a long trip, or any time something feels off.
+
+**Verify:** No unexpected source IPs in `last` output. No unexpected usernames in failed logins. If you see an unfamiliar IP that successfully authenticated, treat it as a security incident.
 
 ### 9.3 ssh-audit (one-shot SSH config scan)
 
@@ -879,9 +986,21 @@ sudo lynis audit system
 
 **How:** `/var/log/auth.log` and `/var/log/syslog` rotate via `logrotate`. Defaults rotate weekly and keep 4 weeks — fine for most cases. Tune in `/etc/logrotate.d/rsyslog` if you need longer.
 
-**Note:** journald stores logs in `/var/log/journal/`. Cap disk use in `/etc/systemd/journald.conf`:
+Cap journald disk usage in `/etc/systemd/journald.conf`:
 ```
 SystemMaxUse=500M
+```
+
+Then reload:
+```bash
+sudo systemctl restart systemd-journald
+```
+
+**Verify:**
+```bash
+journalctl --disk-usage
+# Archived and active journals take up X.XG on disk.
+grep 'SystemMaxUse' /etc/systemd/journald.conf    # 500M
 ```
 
 ### 9.6 (optional) auditd
@@ -892,9 +1011,15 @@ SystemMaxUse=500M
 
 **How:**
 ```bash
-sudo apt install auditd audispd-plugins
+sudo apt install auditd audisp-plugins
 # Use a ruleset like Neo23x0/auditd or Ubuntu CIS — drop into /etc/audit/rules.d/
 sudo systemctl enable --now auditd
+```
+
+**Verify:**
+```bash
+sudo systemctl is-active auditd    # active
+sudo auditctl -l                   # lists active audit rules
 ```
 
 **Caveat:** Generates significant log volume. Only worth it if you have a SIEM or actively review logs.
@@ -908,6 +1033,8 @@ sudo systemctl enable --now auditd
 sudo apt install debsums
 sudo debsums --changed    # files that no longer match the package
 ```
+
+**Verify:** Running `sudo debsums --changed` on a clean system should produce no output. Any output is a finding worth investigating — it may be a legitimate config change or a tampered binary.
 
 **Periodic:** Weekly cron, alert on any output.
 
@@ -939,6 +1066,13 @@ sudo ss -tlnp | grep -E ':2375|:2376'
 
 **Mitigation:** For a solo VPS where you are the docker user anyway, this is an acceptable trade-off. Rootless Docker or Podman eliminate it, but the migration cost is significant for personal infra.
 
+**Verify:**
+```bash
+getent group docker
+# docker:x:999:glenbenatiro
+# Review who's listed — should only be accounts you fully trust.
+```
+
 ### 10.3 Don't bind container ports to 0.0.0.0
 
 **What:** `docker run -p 5432:5432 ...` publishes Postgres to **every interface**, bypassing UFW. Docker manages its own iptables rules in the FORWARD chain and they take effect regardless of UFW rules.
@@ -963,7 +1097,7 @@ For services that only communicate with other containers via Docker's internal n
 sudo ss -tlnp | grep '0\.0\.0\.0:'    # only intended ports should appear here
 ```
 
-**UFW bypass defences:** (1) bind to localhost/tailscale as above, (2) set `"iptables": false` in `/etc/docker/daemon.json` and manage manually (advanced), or (3) use the [`ufw-docker`](https://github.com/chaifeng/ufw-docker) helper script.
+**UFW bypass defences:** (1) bind to localhost/tailscale as above — recommended; (2) use the [`ufw-docker`](https://github.com/chaifeng/ufw-docker) helper script; (3) set `"iptables": false` in `/etc/docker/daemon.json` — **advanced only**: this disables Docker's automatic NAT, breaking container-to-container routing and Traefik's automatic service discovery. Only use this if you're prepared to write all FORWARD rules manually.
 
 ### 10.4 Keep AppArmor's docker-default profile in enforce
 
@@ -987,6 +1121,12 @@ sudo aa-status | grep docker-default    # in enforce mode
 image: postgres:17.6           # specific minor version
 # Or pin by digest for maximum strictness:
 # image: postgres@sha256:...
+```
+
+**Verify:**
+```bash
+docker ps --format 'table {{.Image}}\t{{.Names}}'
+# Review the Image column — no :latest tags should appear for persistent services.
 ```
 
 ---
@@ -1034,6 +1174,13 @@ sudo ss -tlnp | grep '0.0.0.0:'                              # only intended por
 
 echo; echo "=== Reboot required? ==="
 ls /var/run/reboot-required 2>&1                             # not found = good
+
+echo; echo "=== Tailscale ==="
+tailscale status
+systemctl is-enabled tailscaled
+
+echo; echo "=== Docker TCP socket ==="
+sudo ss -tlnp | grep -E ':2375|:2376'                        # want: no output
 ```
 
 Plus, from your laptop / a tailnet peer:
