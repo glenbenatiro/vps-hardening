@@ -61,11 +61,20 @@ echo; echo "=== TAILSCALE ==="
 tailscale status 2>&1 | head -10
 tailscale ip -4 2>&1
 
-echo; echo "=== LISTENING SOCKETS ==="
-ss -tlnp
+echo; echo "=== LISTENING SOCKETS (TCP + UDP) ==="
+ss -tulnp
+echo "--- public-bound only (justify every line) ---"
+ss -tulnp | grep -E '0\.0\.0\.0:|\[::\]:' || echo "(nothing bound to a public interface)"
 
 echo; echo "=== USERS WITH SHELLS ==="
 getent passwd | awk -F: '$7 ~ /(bash|zsh|sh|fish)$/ {print $1":"$3":"$7}'
+
+echo; echo "=== FORGOTTEN SERVICES (headless blind spots) ==="
+loginctl list-users 2>&1
+echo "--- remote-desktop packages (want: empty) ---"
+dpkg -l 2>/dev/null | grep -Ei 'nomachine|xrdp|x11vnc|tigervnc|vino|anydesk|teamviewer' || echo "(none)"
+echo "--- avahi/mDNS ---"
+systemctl is-active avahi-daemon 2>&1
 
 echo; echo "=== SUDOERS.D ==="
 ls -la /etc/sudoers.d/
@@ -96,10 +105,20 @@ which docker >/dev/null 2>&1 && {
 
 echo; echo "=== ~/.ssh PERMS ==="
 ls -la ~/.ssh 2>&1
+echo "--- what this box's keys can reach (blast radius) ---"
+grep -E '^\s*(Host|IdentityFile) ' ~/.ssh/config 2>/dev/null || echo "(no ~/.ssh/config)"
+echo "--- other credential stores present ---"
+ls -d ~/.aws ~/.config/gcloud ~/.kube ~/.docker/config.json 2>/dev/null || echo "(none)"
 
 echo; echo "=== DONE ==="
 AUDIT
 ```
+
+> **Note:** `systemd --user` services don't appear above — the script runs under
+> `sudo` (root's user manager), not the login user's. If `loginctl list-users`
+> shows a human user with lingering enabled, have them run
+> `systemctl --user list-units --type=service` **in their own shell** to surface
+> per-user daemons (see [HARDENING.md §7.7](HARDENING.md#77-remove-forgotten--unnecessary-services-headless-server-blind-spots)).
 
 ### Phase 2 — Map findings to controls
 
@@ -107,6 +126,12 @@ Compare audit output against [HARDENING.md](HARDENING.md) sections. For each con
 - ✅ Already implemented — note + move on
 - ⚠️ Partial — note what's missing
 - ❌ Missing — add to recommendations
+
+**On an existing box, first justify every open port.** Before mapping controls,
+walk the `LISTENING SOCKETS` + `UFW` output per [HARDENING.md §4.4](HARDENING.md#44-auditing-an-already-running-box--justify-every-open-port):
+for each public listener and each UFW ALLOW rule, name the service behind it and
+decide keep / scope-down / remove. Forgotten daemons (remote-desktop tools,
+mDNS, stray `--user` services) surface here, not in the from-scratch checklist.
 
 Categorise findings into tiers:
 - **Tier 0 — Critical fix** (e.g. password auth still enabled, exposed Docker socket, empty password)

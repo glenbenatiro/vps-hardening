@@ -269,6 +269,58 @@ sudo ufw status verbose
 
 **Note:** You'll narrow the SSH rule to the Tailscale interface in Phase 5 (§7.1) once SSH is on its custom port and Tailscale is confirmed stable.
 
+### 4.4 Auditing an already-running box — justify every open port
+
+**What:** On a fresh server you *build* the firewall from nothing. On a box
+that's been running for a while, the firewall and the set of listening daemons
+have accreted over time — old experiments, software that auto-opened a port on
+install, a remote-desktop tool you forgot about. Before trusting the perimeter,
+**enumerate what's actually open and account for each item.**
+
+**Why it protects:** The most common real-world exposure isn't a missing
+control — it's a *forgotten* one. A UFW `ALLOW` rule someone added months ago,
+or a daemon that bound `0.0.0.0` on install, is an open door nobody remembers.
+This step is what turns "UFW is enabled" into "I know exactly what's reachable
+and why."
+
+**How:**
+```bash
+# 1. List every public listener (TCP + UDP, IPv4 + IPv6) WITH the owning process
+sudo ss -tulnp | grep -E '0\.0\.0\.0:|\[::\]:'
+
+# 2. For any port you can't immediately name, trace it to a process/package
+sudo lsof -i :4000                     # what's holding the port
+ps -p <PID> -o pid,ppid,user,cmd       # what it is + who runs it
+sudo ss -tulnp | grep ':4000'          # confirm the bind address
+
+# 3. List every UFW ALLOW rule and ask "why is this here?"
+sudo ufw status numbered
+
+# 4. Cross-check: is every ALLOW rule backed by a service you intend to expose,
+#    and is every public listener backed by an ALLOW rule you intend to keep?
+```
+
+For **each** open port, decide: *keep* (intended public service — e.g. 443),
+*scope down* (bind to localhost/Tailscale, or restrict the UFW rule to your IP),
+or *remove* (stop the service **and** delete the now-orphaned UFW rule). A
+listener with no matching ALLOW rule is harmless-but-confusing; an ALLOW rule
+with no matching service is a hole waiting for the next thing that grabs that
+port.
+
+**Verify:**
+```bash
+# The end state: only the ports you can name out loud are open.
+sudo ss -tulnp | grep -E '0\.0\.0\.0:|\[::\]:'   # e.g. just 22/80/443 + intended
+sudo ufw status numbered                          # every rule maps to a live, intended service
+```
+
+> Real example this playbook was distilled from: a `ufw status` showed
+> `4000/tcp`, `4000/udp`, and `5353/udp` open. Tracing them
+> (`ss -tulnp` → `lsof -i :4000`) revealed a NoMachine remote-desktop daemon and
+> avahi/mDNS — neither needed on a headless VPS. They were removed and the rules
+> deleted. Nothing in a from-scratch checklist would have flagged them; only
+> *justifying every existing open port* did.
+
 ---
 
 ## 5. Phase 3 — SSH hardening
@@ -650,6 +702,64 @@ nc -vz <public-ip> 45097     # should time out
 nc -vz 100.x.x.x 45097      # should connect (from tailnet peer)
 ```
 
+### 7.7 Remove forgotten / unnecessary services (headless-server blind spots)
+
+**What:** Hunt down and remove daemons that have no business running on a
+headless, single-purpose VPS but quietly listen anyway. Three categories account
+for most surprises:
+
+**Why it protects:** Every running daemon is attack surface. The dangerous ones
+are those you didn't install deliberately or have forgotten — they don't show up
+when you reason about "my stack," only when you enumerate what's actually
+running. These are exactly the things §4.4's port audit surfaces; this section is
+how you clean them up.
+
+**A. `systemd --user` services (incl. lingering).** User-level services keep
+running after you log out if *lingering* is enabled — a persistence vector that
+hides from `systemctl list-units` (the system manager) entirely.
+```bash
+# Enumerate per-user services and who has lingering enabled
+systemctl --user list-units --type=service        # run as the user
+loginctl list-users
+loginctl user-status <user> | grep -i linger
+
+# Remove one you don't want:
+systemctl --user disable --now <name>.service
+loginctl disable-linger <user>                     # if nothing else needs it
+```
+
+**B. Remote-desktop daemons.** NoMachine (`nxd`), xrdp, x11vnc/tigervnc,
+AnyDesk, TeamViewer — full GUI login surfaces, usually password-auth, often
+internet-facing on install. On a headless box managed over SSH they're pure
+liability.
+```bash
+# Detect
+dpkg -l | grep -Ei 'nomachine|xrdp|x11vnc|tigervnc|vino|anydesk|teamviewer'
+sudo ss -tulnp | grep -E ':4000|:3389|:590[0-9]'   # NX / RDP / VNC ports
+
+# Remove (NoMachine example — purge the package, drop its firewall rules)
+sudo /usr/NX/bin/nxserver --stop 2>/dev/null
+sudo apt-get purge -y nomachine
+sudo rm -rf /usr/NX
+sudo ufw delete allow 4000/tcp; sudo ufw delete allow 4000/udp
+```
+
+**C. avahi / mDNS (5353).** Service discovery for LANs. On a public VPS it
+serves no purpose and broadcasts info; it also listens on UDP 5353 (which a
+TCP-only port scan misses — see §4.4).
+```bash
+sudo systemctl disable --now avahi-daemon.service avahi-daemon.socket
+# or remove outright: sudo apt-get purge -y avahi-daemon
+sudo ufw delete allow 5353/udp 2>/dev/null
+```
+
+**Verify:**
+```bash
+sudo ss -tulnp | grep -E '0\.0\.0\.0:|\[::\]:'    # the daemon's ports are gone
+systemctl --user list-units --type=service         # no unexpected user services
+dpkg -l | grep -Ei 'nomachine|xrdp|vnc|anydesk|teamviewer'   # empty
+```
+
 ---
 
 ## 8. Phase 6 — OS / kernel hardening
@@ -889,6 +999,54 @@ sudo grep -E '^Defaults' /etc/sudoers         # env_reset, secure_path, use_pty 
 sudo grep -r 'NOPASSWD' /etc/sudoers.d/       # should be empty or expected entries only
 ```
 
+### 8.8 On-box credentials — your server's own keys are a lateral-movement surface
+
+**What:** Inventory the secrets the box itself holds — outbound SSH keys, cloud
+credentials, API tokens, `.env` files — and scope each to least privilege. This
+is about what an attacker gets to do *next* if they ever land on this host.
+
+**Why it protects:** Every hardening control above is about keeping attackers
+*out*. This one limits the *blast radius* if one ever gets in. A box that stores
+a passwordless private key, a cloud credential, or an account-wide GitHub key
+hands the attacker a second target for free. The server's outbound credentials
+are part of its threat model, not just its inbound exposure.
+
+**How:**
+```bash
+# 1. Find private keys and credential files on the box
+ls -la ~/.ssh/                                    # private keys, config
+grep -rIl 'PRIVATE KEY' ~ 2>/dev/null             # stray private keys anywhere in $HOME
+ls -la ~/.aws ~/.config/gcloud ~/.kube ~/.docker/config.json 2>/dev/null
+find ~ -maxdepth 3 -name '.env' -o -name '*.pem' 2>/dev/null | grep -v node_modules
+
+# 2. See what the box's SSH keys can REACH (so you know the blast radius)
+grep -E 'Host |IdentityFile' ~/.ssh/config 2>/dev/null
+```
+
+For each credential found, apply least privilege:
+- **GitHub access:** prefer a **read-only, per-repository deploy key** scoped to
+  only the repos the box needs — *not* a key tied to your whole personal account
+  (which grants read/push to every repo you can touch, a supply-chain risk).
+  For multi-repo push, use a dedicated least-privilege machine-user.
+- **Interactive SSH keys:** add a passphrase and load via `ssh-agent` rather than
+  leaving a passphraseless key on disk.
+- **Cloud creds / tokens:** scope to the minimum IAM permissions; rotate; prefer
+  short-lived/instance credentials over long-lived static keys where available.
+- **`.env` files:** ensure `chmod 600`, never world-readable, never committed.
+
+**Verify:**
+```bash
+ls -la ~/.ssh/                # private keys are 600; you can name what each is for
+grep -E 'Host |IdentityFile' ~/.ssh/config   # every IdentityFile maps to an intended, scoped target
+```
+
+> Real example: this box held `~/.ssh/<key>` that `~/.ssh/config` mapped to
+> `Host github.com` — i.e. the VPS authenticated as the owner's *entire personal
+> GitHub account*. Not server-to-server access, but a breach would expose every
+> repo that account could reach (and allow malicious pushes). The fix is to swap
+> it for a read-only per-repo deploy key — shrinking the blast radius from "whole
+> account" to "these specific repos."
+
 ---
 
 ## 9. Phase 7 — Intrusion detection & monitoring
@@ -1094,8 +1252,13 @@ For services that only communicate with other containers via Docker's internal n
 
 **Verify:**
 ```bash
-sudo ss -tlnp | grep '0\.0\.0\.0:'    # only intended ports should appear here
+sudo ss -tulnp | grep -E '0\.0\.0\.0:|\[::\]:'    # only intended ports (TCP + UDP, IPv4 + IPv6)
 ```
+
+> **Why `-tulnp` and both address forms:** a TCP-only/IPv4-only check
+> (`ss -tlnp | grep 0.0.0.0:`) silently misses UDP services (mDNS/avahi on
+> 5353, some remote-desktop daemons) and anything bound to `[::]` (IPv6). A
+> forgotten daemon listening on `[::]:4000/udp` would pass the old check.
 
 **UFW bypass defences:** (1) bind to localhost/tailscale as above — recommended; (2) use the [`ufw-docker`](https://github.com/chaifeng/ufw-docker) helper script; (3) set `"iptables": false` in `/etc/docker/daemon.json` — **advanced only**: this disables Docker's automatic NAT, breaking container-to-container routing and Traefik's automatic service discovery. Only use this if you're prepared to write all FORWARD rules manually.
 
@@ -1127,6 +1290,108 @@ image: postgres:17.6           # specific minor version
 ```bash
 docker ps --format 'table {{.Image}}\t{{.Names}}'
 # Review the Image column — no :latest tags should appear for persistent services.
+```
+
+### 10.6 Restrict admin UIs behind the reverse proxy
+
+**What:** A reverse proxy (Traefik, Caddy, nginx) terminates TLS and routes to
+containers — but TLS is *encryption*, not *authentication*. An admin UI exposed
+through it (n8n editor, Portainer, Grafana, Adminer) is reachable by anyone on
+the internet; the only barrier is that app's own login. Put a **network-layer**
+gate in front of it.
+
+**Why it protects:** Application logins get brute-forced, leak via CVEs, or sit
+on default/weak credentials. For a UI only *you* use, there's no reason for the
+whole internet to even reach the login page. The key distinction: **admin UIs
+should be restricted; public endpoints (webhooks, the public site) must stay
+open.** Split them onto separate routers so you can lock one without breaking the
+other.
+
+**How (Traefik labels — IP-allowlist on the admin router only):**
+```yaml
+labels:
+  - "traefik.enable=true"
+
+  # Public router — e.g. webhooks. Stays open to the world.
+  - "traefik.http.routers.app-webhook.rule=Host(`hooks.example.com`)"
+  - "traefik.http.routers.app-webhook.entrypoints=websecure"
+  - "traefik.http.routers.app-webhook.tls.certresolver=letsencrypt"
+
+  # Admin/editor router — restricted to your IP(s) via an allowlist middleware.
+  - "traefik.http.routers.app-editor.rule=Host(`app.example.com`)"
+  - "traefik.http.routers.app-editor.entrypoints=websecure"
+  - "traefik.http.routers.app-editor.tls.certresolver=letsencrypt"
+  - "traefik.http.routers.app-editor.middlewares=admin-allowlist"
+  - "traefik.http.middlewares.admin-allowlist.ipallowlist.sourcerange=203.0.113.4/32,100.64.0.0/10"
+```
+- `sourcerange` = your static IP(s) and/or your Tailscale CGNAT range
+  (`100.64.0.0/10`) so you reach it over the tailnet.
+- No static IP? Use a **forward-auth** middleware (Authelia, tinyauth,
+  oauth2-proxy) for an SSO/login gate at the proxy instead of an IP list.
+- Belt-and-braces at the app layer: enable the app's **MFA**, ensure the
+  first-run setup screen isn't still open, and disable unused public APIs
+  (e.g. n8n `N8N_PUBLIC_API_DISABLED=true`).
+- Public endpoints that must stay open (webhooks) should authenticate inbound
+  requests themselves (signed/HMAC tokens), since you can't IP-restrict them.
+
+**Verify:**
+```bash
+# From a NON-allowlisted network: the admin host should be blocked at the proxy.
+curl -sI https://app.example.com/        # expect 403 (Forbidden) from Traefik
+# The public host should still serve:
+curl -sI https://hooks.example.com/      # expect 200/401 from the app, not 403
+```
+
+### 10.7 Data at rest & backups
+
+**What:** Two things that hardening guides routinely skip but matter most when
+you store real data: keeping it **encrypted at rest** and having **recoverable,
+off-box backups**. Relevant to any persistent data store (Postgres, n8n, Redis,
+uploaded files) — typically Docker volumes on this kind of box.
+
+**Why it protects:** Perimeter hardening reduces the chance of compromise;
+encryption and backups limit the *damage* when something goes wrong — a breach,
+a bad `docker volume rm`, a disk failure, or a ransomware-style event. The
+failure that hurts most in practice isn't a missing firewall rule; it's
+discovering your only copy of client data is gone, or that a stolen DB dump was
+plaintext.
+
+**How:**
+- **Application encryption keys:** many apps encrypt stored secrets only if a key
+  is set. n8n: confirm `N8N_ENCRYPTION_KEY` is set (credentials in Postgres are
+  encrypted with it) — **and back the key up separately**; lose it and the
+  encrypted data is unrecoverable. Treat it like a password, not a config value.
+  ```bash
+  docker exec <n8n-container> printenv | grep -q N8N_ENCRYPTION_KEY \
+    && echo "encryption key set" || echo "WARNING: no encryption key"
+  ```
+- **Know where the data lives:**
+  ```bash
+  docker volume ls
+  docker inspect <db-container> --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{println}}{{end}}'
+  ```
+- **Backups — encrypted, off-box, automated:** dump the DB, encrypt the dump,
+  ship it off the server (object storage / another host). A backup that lives
+  only on the same VPS dies with it.
+  ```bash
+  # Example: nightly encrypted Postgres dump pushed off-box
+  docker exec <db-container> pg_dump -U <user> <db> \
+    | gzip \
+    | gpg --encrypt --recipient you@example.com \
+    > /backups/db-$(date +%F).sql.gz.gpg
+  # then sync /backups to off-box storage (rclone/restic/aws s3 cp ...)
+  ```
+  Prefer a tool like **restic** or **borg** (encrypted, deduplicated, incremental)
+  for anything beyond a toy setup.
+- **Test restores.** An untested backup is a hope, not a backup. Periodically
+  restore into a throwaway container and confirm the data is intact.
+
+**Verify:**
+```bash
+ls -lh /backups/                       # recent dumps exist
+gpg --list-packets /backups/<latest>.gpg >/dev/null 2>&1 && echo "encrypted ✓"
+# Off-box copy is current (check your remote: rclone lsl <remote>, restic snapshots, etc.)
+# Restore drill: load the latest dump into a scratch DB and sanity-check row counts.
 ```
 
 ---
@@ -1169,8 +1434,8 @@ sudo passwd -S root                                          # want: L
 echo; echo "=== Empty passwords ==="
 sudo awk -F: '$2==""{print "EMPTY:"$1}' /etc/shadow         # want: blank output
 
-echo; echo "=== Listening sockets (public 0.0.0.0) ==="
-sudo ss -tlnp | grep '0.0.0.0:'                              # only intended ports
+echo; echo "=== Listening sockets (public — TCP + UDP, IPv4 + IPv6) ==="
+sudo ss -tulnp | grep -E '0\.0\.0\.0:|\[::\]:'               # only intended ports; -u catches UDP (mDNS etc.)
 
 echo; echo "=== Reboot required? ==="
 ls /var/run/reboot-required 2>&1                             # not found = good

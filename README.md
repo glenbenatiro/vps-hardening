@@ -2,6 +2,8 @@
 
 A reusable VPS hardening playbook + Claude Code skill, distilled from a real audit of an Ubuntu 24.04 box on Contabo.
 
+Works two ways: **harden a fresh server** top-to-bottom, or **audit an existing one** — enumerating what's actually open and justifying every listening port and firewall rule (§4.4), which is where forgotten daemons, stray credentials, and exposed admin UIs surface.
+
 ## What's in here
 
 | File | Purpose |
