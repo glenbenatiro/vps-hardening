@@ -19,6 +19,7 @@ You are walking the user through hardening a Linux VPS. The reference doc is [HA
 8. **Sudo via Claude Code's bash:** if `sudo` prompts for a password, the bash tool can't supply one (no tty). Either ask the user to run sudo commands in their own shell, OR have them paste a single composite script (heredoc) into a sudo-cached terminal.
 9. **Before changing the SSH port, run `systemctl is-active ssh.socket`.** On Ubuntu 24.04+ SSH is often socket-activated: the port lives in the `ssh.socket` unit, not `sshd_config` (editing `Port` there does nothing), and a bare `ListenStream=<port>` binds **IPv6-only** and drops IPv4 — a silent lockout. Use the socket-aware recipe (HARDENING.md §5.3).
 10. **A cloud/provider firewall is edge-side and Docker can't bypass it.** When a public port is genuinely needed (including any Docker `0.0.0.0` publish), remind the user to allow it in the provider panel — and prefer `127.0.0.1` binding so it never needs to be public (HARDENING.md §4.1, §10.3).
+11. **Verify SSH auth with `sshd -T`, not the drop-in file — cloud images silently override you.** Ubuntu cloud images (incl. Contabo) ship `/etc/ssh/sshd_config.d/50-cloud-init.conf` with `PasswordAuthentication yes`, which wins by *first-match* over a `99-local.conf`. Fix `50-cloud-init.conf` itself, set `ssh_pwauth: false` in `/etc/cloud/cloud.cfg.d/`, and confirm the *effective* value with `sudo sshd -T | grep -i passwordauth` (HARDENING.md §5.2).
 
 ---
 
@@ -181,6 +182,13 @@ net.core.bpf_jit_harden = 2
 kernel.randomize_va_space = 2
 EOF
 sysctl --system
+
+# 2b. Make two of the above actually STICK (they get silently reverted otherwise):
+#     apport re-enables fs.suid_dumpable=2 at boot; UFW's IPT_SYSCTL resets log_martians=0 on start.
+systemctl disable --now apport 2>/dev/null || true
+sed -i 's/^enabled=1/enabled=0/' /etc/default/apport 2>/dev/null || true
+sed -i 's#^net/ipv4/conf/all/log_martians=0#net/ipv4/conf/all/log_martians=1#' /etc/ufw/sysctl.conf 2>/dev/null || true
+sed -i 's#^net/ipv4/conf/default/log_martians=0#net/ipv4/conf/default/log_martians=1#' /etc/ufw/sysctl.conf 2>/dev/null || true
 
 # 3. Auto-reboot for unattended-upgrades
 if ! grep -q 'Automatic-Reboot "true"' /etc/apt/apt.conf.d/50unattended-upgrades 2>/dev/null; then

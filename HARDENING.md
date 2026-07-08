@@ -386,6 +386,14 @@ sudo sshd -T | grep -i passwordauth     # passwordauthentication no
 ```
 Try: `ssh -o PreferredAuthentications=password -p 22 user@vps` — should fail.
 
+> **Trap — cloud-init override:** cloud images (incl. Contabo) ship `/etc/ssh/sshd_config.d/50-cloud-init.conf` containing `PasswordAuthentication yes`. sshd takes the **first** value across the numerically-sorted drop-ins, so `50-cloud-init.conf` **wins over your `99-local.conf`** and password auth silently stays *on*. Fix it at the source and stop cloud-init re-enabling it on the next boot:
+> ```bash
+> sudo sed -i 's/^PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config.d/50-cloud-init.conf
+> echo 'ssh_pwauth: false' | sudo tee /etc/cloud/cloud.cfg.d/99-disable-ssh-pwauth.cfg
+> sudo systemctl reload ssh
+> ```
+> Always confirm with the *effective* value (`sudo sshd -T | grep -i passwordauth`), never just your own drop-in file.
+
 ### 5.3 Custom SSH port
 
 **What:** Move sshd off port 22.
@@ -454,6 +462,8 @@ sudo ss -tlnp | grep <SSH-PORT>     # listening on the new port (both v4 + v6)
 sudo ufw status verbose             # 22 gone, <SSH-PORT> present
 ```
 
+> **Note — `sshd -T` misreports the port under socket activation.** It still prints `port 22` / `listenaddress 0.0.0.0:22` because the *socket unit* owns the port, not `sshd_config`. That's cosmetic; trust `ss -tlnp` and `systemctl show ssh.socket -p Listen` for the real listener, not `sshd -T`.
+
 **Caveat — RHEL/Fedora:** SELinux needs `semanage port -a -t ssh_port_t -p tcp <SSH-PORT>`. Ubuntu/Debian (no SELinux by default) doesn't.
 
 **Caveat — fail2ban:** if fail2ban is already installed, its `[sshd]` jail defaults to port `ssh` (22). After moving the port, set `port = <SSH-PORT>` in the jail so bans apply to the new port (see §9.1).
@@ -479,6 +489,8 @@ sudo sshd -t && sudo systemctl restart ssh
 sudo sshd -T | grep permitroot    # permitrootlogin no
 ssh -p <SSH-PORT> root@vps             # should fail
 ```
+
+> **Belt & suspenders:** stock `/etc/ssh/sshd_config` ships `PermitRootLogin yes` (often ~line 42). Your `99-local.conf` overrides it only by include-order/first-match — so if that drop-in were ever removed or renamed, root SSH would silently re-open. Set the base file too: `sudo sed -i 's/^PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config`.
 
 ### 5.5 Restrict to specific users (AllowUsers)
 
@@ -924,6 +936,13 @@ sysctl net.ipv4.tcp_syncookies net.ipv4.conf.all.rp_filter \
 # All should show the hardened values set above.
 ```
 
+> **Gotcha — UFW re-applies its own sysctl and overrides `log_martians`.** `/etc/default/ufw` sets `IPT_SYSCTL=/etc/ufw/sysctl.conf`, and that file ships `net/ipv4/conf/all/log_martians=0`. Because `ufw` starts *after* `systemd-sysctl`, it **resets `log_martians` back to 0** on every boot — your value is silently lost (keys UFW doesn't touch, like `rp_filter`, survive, which is what makes this easy to miss). Fix it at UFW's source:
+> ```bash
+> sudo sed -i 's#^net/ipv4/conf/all/log_martians=0#net/ipv4/conf/all/log_martians=1#' /etc/ufw/sysctl.conf
+> sudo sed -i 's#^net/ipv4/conf/default/log_martians=0#net/ipv4/conf/default/log_martians=1#' /etc/ufw/sysctl.conf
+> sudo systemctl reload ufw
+> ```
+
 ### 8.4 Sysctl: filesystem hardening
 
 **What:** Kernel knobs that prevent file-system race-condition exploits.
@@ -958,6 +977,12 @@ sysctl fs.protected_hardlinks fs.protected_symlinks \
 # fs.protected_regular = 1
 # fs.suid_dumpable = 0
 ```
+
+> **Gotcha — `apport` resets `suid_dumpable` to 2 at boot.** Ubuntu's crash reporter re-enables SUID core dumps *after* `systemd-sysctl` runs, so `fs.suid_dumpable = 0` won't stick while apport is active. Servers don't need apport — disabling it also removes a crash-handling attack surface:
+> ```bash
+> sudo systemctl disable --now apport
+> sudo sed -i 's/^enabled=1/enabled=0/' /etc/default/apport
+> ```
 
 ### 8.5 Sysctl: kernel info-leak hardening
 
