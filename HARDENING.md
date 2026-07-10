@@ -217,6 +217,7 @@ Contabo now ships a free **Cloud Firewall**, configured in the customer panel (n
 - **Leave outbound unrestricted** (Contabo's default). Egress is what lets Tailscale reach its control plane / DERP relays, ACME reach Let's Encrypt, and apt fetch updates. Lock it down only if you know exactly what the box calls out to.
 - **Tailnet-only SSH, the easy way:** just *don't* add the `<SSH-PORT>` rule. With Tailscale's UDP 41641 allowed, SSH still reaches you over the tunnel (it surfaces on `tailscale0` from inside, never as public TCP), but the public internet can't touch the SSH port at all. This is the cloud-firewall equivalent of §7.1 and avoids the boot-order lockout risk of §7.6.
 - **This is also your Docker backstop.** Because the edge sits above Docker, any container port you didn't explicitly allow here is unreachable from the internet even if it's published to `0.0.0.0` (§10.3). Keep 127.0.0.1 binding as the primary control and treat the firewall as the automatic safety net.
+- **Fronting the origin with a CDN?** If your public sites sit behind Cloudflare (or another proxy), tighten the 80/443 `Source` from "Any" to the CDN's published IP ranges, so nobody can reach your origin directly by IP — and note that with DNS-01 certificates you no longer need port 80 open at all. See §10.8 (origin lockdown) and §10.9 (DNS-01).
 
 ### 4.2 Private overlay network (Tailscale)
 
@@ -1490,6 +1491,172 @@ ls -lh /backups/                       # recent dumps exist
 gpg --list-packets /backups/<latest>.gpg >/dev/null 2>&1 && echo "encrypted ✓"
 # Off-box copy is current (check your remote: rclone lsl <remote>, restic snapshots, etc.)
 # Restore drill: load the latest dump into a scratch DB and sanity-check row counts.
+```
+
+### 10.8 Put the origin behind a CDN/proxy and accept only its IPs (Cloudflare worked example)
+
+**What:** When your public sites sit behind a CDN/proxy (Cloudflare, Fastly, Bunny),
+visitors reach the *CDN* and the CDN reaches your *origin*. Anyone who discovers your
+origin IP can still connect to it **directly** — bypassing the CDN's WAF, rate-limiting,
+and bot protection. Close that door: make the origin accept 80/443 **only from the CDN's
+published IP ranges**.
+
+**Why it protects:** A proxied hostname hides your origin IP in DNS, but the IP leaks in
+practice (stale DNS records, TLS certificate logs, email headers, mass scanning). Once it's
+known, an attacker hits the origin directly and every protection you bought from the CDN is
+skipped. Restricting the origin to the CDN's ranges drops direct-to-IP traffic, so the CDN
+becomes the *only* way in.
+
+**How — two layers.** Layer 0 is the real drop; Layer 7 is defence in depth.
+
+*Layer 0 — cloud firewall (see §4.1.1).* Restrict inbound 80/443 to the CDN's ranges.
+Cloudflare publishes them at `https://www.cloudflare.com/ips-v4` and `/ips-v6` (re-check
+before pasting — they change rarely but they do change):
+```
+# Cloudflare IPv4
+173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18
+108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17
+162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22
+```
+Set these as the **Source** on the 80 and 443 allow rules; the default `Block all` drops
+everyone else.
+
+*Layer 7 — Traefik `ipAllowList`.* So a firewall misconfig doesn't expose the origin. Because
+the CDN proxies the connection, **the source IP Traefik sees *is* the CDN edge IP** — so the
+default IP strategy is correct; no `depth`/`X-Forwarded-For` handling needed. Define it in a
+dynamic-config file and attach it at the entrypoint so every router is covered:
+```yaml
+# dynamic/cdn-only.yml  (file provider)
+http:
+  middlewares:
+    cdn-only:
+      ipAllowList:
+        sourceRange:            # the CDN's IPv4 + IPv6 ranges
+          - 173.245.48.0/20
+          - 2400:cb00::/32
+          # ...the full list...
+```
+```yaml
+# traefik.yml (static) — apply to every HTTPS router
+entryPoints:
+  websecure:
+    address: ":443"
+    http:
+      middlewares:
+        - "cdn-only@file"
+```
+Non-CDN sources now get **403** at the proxy.
+
+**Two gotchas worth knowing:**
+- **IPv6 bypass.** If your origin has a public IPv6 address and the proxy listens on it
+  (`[::]:80/443`), an IPv4-only firewall rule leaves the v6 door open. If the CDN reaches
+  your origin over IPv4 only (no `AAAA` record on the origin), bind the proxy's ports
+  **IPv4-only** so there's no v6 listener to bypass — with Docker, specify the host IP:
+  `- "0.0.0.0:443:443"` (see §10.3).
+- **Port 80 is optional.** With the CDN's "always use HTTPS" enabled, the CDN does the
+  http→https redirect at its *edge* and never touches your origin's port 80. Scope 80 to the
+  CDN like 443, or drop it entirely — visitors are unaffected either way.
+
+**Verify — from an *external, non-CDN* machine** (a second VPS, or a public TCP checker). A
+test from the box itself hairpins and won't traverse the edge firewall, so it proves nothing:
+```bash
+# Direct to the origin IP, bypassing the CDN — should TIME OUT (firewall) or 403 (Traefik):
+curl -sS -o /dev/null -w '%{http_code}\n' --resolve app.example.com:443:<origin-ip> \
+  --connect-timeout 6 https://app.example.com || echo "blocked"
+# Through the CDN — should still work:
+curl -sI https://app.example.com | head -1        # expect 200/3xx
+```
+
+### 10.9 TLS issuance: prefer DNS-01 when the origin is locked down
+
+**What:** Let's Encrypt proves you control a domain via a *challenge*. **HTTP-01** answers an
+inbound request on port 80; **DNS-01** writes a temporary DNS `TXT` record. Once you've locked
+the origin to a CDN (§10.8), prefer **DNS-01** — it depends on no inbound port.
+
+**Why it protects:** HTTP-01 renewal only works while an inbound request can reach the origin
+on port 80. Behind a locked/proxied origin that's fragile — a CDN edge redirect, a tightened
+firewall rule, or an IPv4-only bind can silently break renewal, and you don't find out until a
+certificate **expires ~90 days later**. DNS-01 proves control out-of-band (an outbound API call
+that creates a `TXT` record), so renewal is independent of your inbound firewall — and it
+unlocks wildcard certificates.
+
+**How (Traefik + Cloudflare — native, no scripting):** Traefik bundles the `lego` ACME library
+with built-in DNS providers, so DNS-01 is pure config:
+```yaml
+# traefik.yml (static)
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: "you@example.com"   # literal — Traefik does NOT expand ${ENV} in static config
+      storage: "/etc/traefik/acme.json"
+      dnsChallenge:
+        provider: cloudflare     # built-in; no plugin, no script
+        resolvers: ["1.1.1.1:53"]
+```
+```yaml
+# docker-compose.yml — the token reaches lego via the container environment
+environment:
+  - "CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN}"
+```
+- **Scope the token minimally:** a Cloudflare API token with `Zone:Read` + `DNS:Edit` on only
+  the zones you use. Optionally add **client-IP filtering** to your origin's egress IP — but the
+  container must actually egress from that IP (Docker containers are typically IPv4-only, which
+  is fine here).
+- **The `${ENV}` gotcha:** Traefik does **not** interpolate `${VAR}` inside its *static* config
+  file — the email above is read literally, so a `${ACME_EMAIL}` there silently fails. Secrets
+  like the DNS token are read by `lego` from the process **environment** (hence the compose
+  `environment:` line), not from the YAML. Only *dynamic* config files support templating.
+
+**Verify:**
+```bash
+docker logs <traefik-container> 2>&1 | grep -i 'dns-01'   # "type=dns-01" on issuance/renewal
+# and the served cert is a real CA cert, not the default self-signed:
+echo | openssl s_client -servername app.example.com -connect app.example.com:443 2>/dev/null \
+  | openssl x509 -noout -issuer -enddate
+```
+
+### 10.10 Security response headers at the proxy
+
+**What:** Set browser security headers (HSTS, `nosniff`, anti-clickjacking) **once** at the
+reverse proxy as a shared middleware applied to every site — rather than copy-pasting them per
+service.
+
+**Why it protects:** These headers tell browsers to enforce protections — force HTTPS (HSTS),
+stop MIME-sniffing (`nosniff`), block clickjacking (`X-Frame-Options`). Defining them per
+service **drifts**: sites disagree over time and new ones get forgotten entirely (the classic
+"three services have headers, the fourth has none"). One definition at the entrypoint covers
+every current and future site identically.
+
+**How (Traefik file provider + entrypoint):**
+```yaml
+# dynamic/security-headers.yml
+http:
+  middlewares:
+    security-headers:
+      headers:
+        stsSeconds: 31536000       # HSTS — 1 year (min for preload eligibility)
+        stsIncludeSubdomains: true
+        stsPreload: true
+        contentTypeNosniff: true   # X-Content-Type-Options: nosniff
+        frameDeny: true            # X-Frame-Options: DENY (anti-clickjacking)
+```
+```yaml
+# traefik.yml — attach at the entrypoint so every router inherits it
+entryPoints:
+  websecure:
+    http:
+      middlewares:
+        - "cdn-only@file"          # from §10.8
+        - "security-headers@file"
+```
+Ordering it after the CDN allowlist (§10.8) means non-CDN traffic is rejected before any work
+is done. `frameDeny` blocks *all* framing — exempt a site with a per-router middleware if it's
+meant to be embedded.
+
+**Verify:**
+```bash
+curl -sI https://app.example.com | grep -iE 'strict-transport|x-frame|x-content-type'
+# expect: strict-transport-security, x-frame-options: DENY, x-content-type-options: nosniff
 ```
 
 ---

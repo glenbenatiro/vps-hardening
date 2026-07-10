@@ -8,7 +8,7 @@ Works two ways: **harden a fresh server** top-to-bottom, or **audit an existing 
 
 | File | Purpose |
 |---|---|
-| **[HARDENING.md](HARDENING.md)** | The comprehensive reference doc. Each control has *what / why / how / verify*. Read top-to-bottom for a fresh server, or jump to the relevant section as a lookup. Covers cloud/provider firewalls (incl. the **Contabo Cloud Firewall**), socket-activated SSH on Ubuntu 24.04, and the Docker-bypasses-UFW problem. |
+| **[HARDENING.md](HARDENING.md)** | The comprehensive reference doc. Each control has *what / why / how / verify*. Read top-to-bottom for a fresh server, or jump to the relevant section as a lookup. Covers cloud/provider firewalls (incl. the **Contabo Cloud Firewall**), socket-activated SSH on Ubuntu 24.04, the Docker-bypasses-UFW problem, and reverse-proxy hardening — locking the origin to a CDN's IP ranges (Cloudflare), DNS-01 certificates, and shared security headers. |
 | **[SKILL.md](SKILL.md)** | A Claude Code skill that walks an LLM (or a human) through auditing + hardening a VPS interactively, with safety rails. References HARDENING.md as the canonical reference. |
 | **[scripts/audit.sh](scripts/audit.sh)** | A self-contained **read-only** audit (makes no changes). Run it, and it writes a timestamped log next to itself. |
 | **[scripts/analyze-prompt.md](scripts/analyze-prompt.md)** | A prompt for Claude Code to read the audit log and grade the box PASS/ATTENTION/FAIL against the playbook. |
