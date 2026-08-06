@@ -81,8 +81,21 @@ If you've done all five, an attacker needs to compromise multiple independent la
 1. Restarting sshd with `Match` blocks in a broken state (config valid syntactically, but Match excludes you).
 2. UFW reset on a remote box without re-allowing SSH.
 3. Setting `AllowUsers someuser` and that user not existing or not having keys.
-4. Binding sshd to `ListenAddress 100.x.x.x` (Tailscale) before Tailscale is actually up.
-5. Locking root password before confirming sudo works for the unprivileged user.
+4. Binding sshd to an overlay IP (`ListenAddress 100.x.x.x`) on a host where the overlay may not come up.
+   **On socket-activated Ubuntu 24.04 this is less dangerous than it sounds** — the shipped
+   `ssh.socket` sets `FreeBind=yes`, which lets systemd bind an address that does not exist yet,
+   so boot ordering against `tailscaled` is already handled. Verify before relying on it:
+   `systemctl show ssh.socket -p FreeBind`. On a classic (non-socket) sshd, or with `FreeBind=no`,
+   the original warning stands: sshd fails to bind and you lose remote access.
+5. **Overlay node-key expiry.** Tailscale device keys expire (~180 days by default). When the key
+   lapses the host silently drops off the tailnet — and if sshd is bound tailnet-only, or UFW only
+   allows SSH on the overlay interface, that is a *total* lockout with no public port to fall back
+   on. This is the most likely lockout in an overlay-only setup, and it fires months after the
+   change that caused it. **Disable key expiry for servers before binding overlay-only** (§4.2).
+6. Editing `ListenAddress`/`Port` and then running only `systemctl reload ssh` on a socket-activated
+   box — the listener does not change, so you believe a restriction is in force when it is not.
+   Use `daemon-reload` + `restart ssh.socket`, then confirm with `ss -tlnp` (§5.3).
+7. Locking root password before confirming sudo works for the unprivileged user.
 
 The phase sequence below is designed specifically to avoid all of these.
 
@@ -248,8 +261,38 @@ systemctl is-enabled tailscaled   # must be "enabled" — critical for §7.6
 
 From a tailnet peer (your laptop), ping the VPS by its tailscale name: `ping vps-myhost`.
 
+**Disable node-key expiry on servers — do this BEFORE §7.1 or §7.6.**
+
+Tailscale device keys expire (~180 days by default). On a laptop that just means
+re-authenticating. On a headless server whose *only* SSH path is the tailnet, expiry silently
+drops the host off the network and locks you out completely — months after you set it up, with
+no obvious connection to the change that caused it.
+
+```bash
+# Check this host's expiry (null / "None" = disabled, which is what you want on a server)
+tailscale status --json | grep -i keyexpiry
+
+# Check every device at once — catches peers that have already lapsed
+tailscale status   # look for "offline, last seen ..." on hosts you expect to be up
+```
+
+Disable it in the admin console: **login.tailscale.com → Machines → `<HOST>` → ⋯ →
+*Disable key expiry***. There is no CLI equivalent; it is a control-plane setting.
+
+Re-verify afterwards — `KeyExpiry` should come back null:
+```bash
+tailscale status --json | grep -i keyexpiry
+```
+
+> The local daemon reports what it has synced from the control plane. If the value has not
+> changed, confirm in the admin console rather than assuming propagation lag.
+
 **Caveats:**
 - Tailscale relies on its control plane. If Tailscale goes down on the VPS and SSH is bound only to the tailnet IP (§7.6), you need the cloud console to recover.
+- **Confirm your provider's out-of-band console works before you need it.** A web/VNC console is the
+  only recovery path once SSH is overlay-only. Many providers let you disable it — which is good
+  hygiene, since it bypasses SSH entirely — but then verify you can re-enable it on demand, and
+  that the account protecting it has MFA.
 - Free tier: up to 100 devices — more than enough for personal/small-team.
 
 ### 4.3 UFW — host firewall
@@ -405,10 +448,31 @@ Try: `ssh -o PreferredAuthentications=password -p 22 user@vps` — should fail.
 
 **First, check how sshd is started** — this decides *where* the port lives:
 ```bash
-systemctl is-active ssh.socket    # "active" → socket-activated (Ubuntu 24.04+ often is)
+systemctl is-active ssh.socket                     # "active" → socket-activated (Ubuntu 24.04+ often is)
+systemctl show ssh.socket -p DropInPaths --value   # which file actually feeds the socket
 ```
 - `ssh.socket` **inactive** → classic path (edit `sshd_config`), below.
-- `ssh.socket` **active** → the port is owned by the *socket unit*, not `sshd_config`. Editing `Port` in `sshd_config` does **nothing**. Use the socket method further down.
+- `ssh.socket` **active** → the port is owned by the *socket unit*. **Which file feeds that socket decides whether `sshd_config` still matters** — see the two sub-cases below.
+
+> **Two socket-activated sub-cases — check `DropInPaths` before editing anything.**
+> Ubuntu 24.04's `openssh-server` ships `/usr/lib/systemd/system-generators/sshd-socket-generator`,
+> which *reads* `sshd_config` and writes `/run/systemd/generator/ssh.socket.d/addresses.conf`.
+>
+> | `DropInPaths` contains | Authoritative source | `sshd -T` trustworthy? |
+> |---|---|---|
+> | only `/run/systemd/generator/…` | **`sshd_config`** — `Port` and `ListenAddress` *do* work | yes |
+> | `/etc/systemd/system/ssh.socket.d/…` | **that manual drop-in** — `sshd_config` is ignored | no |
+>
+> `/etc` drop-ins outrank generator output, so the manual method below *creates* the second
+> case. Both are valid — just know which one you're in.
+>
+> **In either case, `systemctl reload ssh` will NOT change the listening address.** The
+> generator only re-runs on `daemon-reload`:
+> ```bash
+> sudo systemctl daemon-reload && sudo systemctl restart ssh.socket
+> ```
+> Reloading sshd alone leaves the old listener in place with no error — the classic way to
+> believe you're protected when you aren't. Always confirm with `ss -tlnp` afterwards.
 
 **Classic (sshd_config-controlled) sshd:**
 ```bash
@@ -430,7 +494,7 @@ sudo ufw delete allow 22/tcp
 > Adding *only* `Port <SSH-PORT>` when 22 was merely the default (no explicit `Port` line anywhere) **drops 22** — list both during the transition so you never cut your only way in.
 
 **Socket-activated sshd (Ubuntu 24.04+):** the listening port lives in `ssh.socket`. Two traps here, both real lockouts:
-> **Trap 1 — wrong file:** editing `Port` in `sshd_config` has no effect; the socket owns the port.
+> **Trap 1 — wrong file:** *once the manual drop-in below exists*, editing `Port` in `sshd_config` has no effect — `/etc/systemd/system/ssh.socket.d/` outranks the generator. On a stock box with no manual drop-in, `sshd_config` still drives the socket (see the sub-case table in §5.3). Check `DropInPaths` to know which applies.
 > **Trap 2 — IPv6-only:** the base `ssh.socket` sets `BindIPv6Only=ipv6-only`, so a bare `ListenStream=<SSH-PORT>` binds **IPv6 only** and silently drops IPv4. You *must* list both address families.
 ```bash
 # 1. Allow the new port at UFW (and at your cloud firewall)
@@ -463,7 +527,17 @@ sudo ss -tlnp | grep <SSH-PORT>     # listening on the new port (both v4 + v6)
 sudo ufw status verbose             # 22 gone, <SSH-PORT> present
 ```
 
-> **Note — `sshd -T` misreports the port under socket activation.** It still prints `port 22` / `listenaddress 0.0.0.0:22` because the *socket unit* owns the port, not `sshd_config`. That's cosmetic; trust `ss -tlnp` and `systemctl show ssh.socket -p Listen` for the real listener, not `sshd -T`.
+> **Note — when `sshd -T` can be trusted under socket activation.** It reports what
+> `sshd_config` says, which is only the truth if `sshd_config` is what feeds the socket:
+>
+> - **Generator-driven box** (`DropInPaths` shows only `/run/systemd/generator/…`) — `sshd -T`
+>   is accurate, because the generator derived the socket addresses from that same config.
+> - **Manual drop-in present** (`/etc/systemd/system/ssh.socket.d/…`) — `sshd -T` reports the
+>   `sshd_config` values while the socket listens on the drop-in's. It will happily print
+>   `port 22` while the box actually listens elsewhere.
+>
+> `ss -tlnp` and `systemctl show ssh.socket -p Listen` are authoritative in **both** cases —
+> prefer them when the two disagree.
 
 **Caveat — RHEL/Fedora:** SELinux needs `semanage port -a -t ssh_port_t -p tcp <SSH-PORT>`. Ubuntu/Debian (no SELinux by default) doesn't.
 
@@ -743,35 +817,68 @@ ssh-audit -p <SSH-PORT> <vps-ip>
 
 **Critical caveat — highest lockout risk in this guide:** If Tailscale fails to start after a reboot and sshd is bound to its IP, SSH is completely unavailable. The cloud console is your **only** recovery path. Before proceeding:
 
-1. Confirm `tailscaled` is enabled at boot and has survived at least one reboot:
+1. **Disable node-key expiry for this host (§4.2).** A lapsed key drops the box off the tailnet
+   months later and locks you out exactly as hard as tailscaled failing. Do this first:
+   ```bash
+   tailscale status --json | grep -i keyexpiry    # want null / "None"
+   ```
+2. Confirm `tailscaled` is enabled at boot and has survived at least one reboot:
    ```bash
    systemctl is-enabled tailscaled    # must be "enabled"
    tailscale status                   # must be "Running"
    ```
-2. If you haven't rebooted since installing Tailscale, do so now and confirm it comes back before continuing.
-3. Have your cloud-provider console open and ready.
-4. Keep at least two SSH sessions open while applying this step.
+3. If you haven't rebooted since installing Tailscale, do so now and confirm it comes back before continuing.
+4. Have your cloud-provider console open and ready — and if you keep it disabled by default,
+   confirm you can re-enable it (§4.2).
+5. Keep at least two SSH sessions open while applying this step.
 
 **How:**
 ```bash
 TS4=$(tailscale ip -4)
 TS6=$(tailscale ip -6)
+sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak-$(date +%Y%m%d-%H%M%S)
 sudo tee -a /etc/ssh/sshd_config.d/99-local.conf <<EOF
 
 ListenAddress $TS4
 ListenAddress $TS6
 EOF
-sudo sshd -t && sudo systemctl restart ssh
+sudo sshd -t || echo "INVALID — restore the backup, do not proceed"
 ```
 
-**Verify:**
+Then apply it **the way that matches how sshd is started** (§5.3) — this is where people get a
+false sense of security:
+
 ```bash
-sudo ss -tlnp | grep ssh
-# Should show LISTEN only on Tailscale IPs, NOT on 0.0.0.0
+# Socket-activated (Ubuntu 24.04+, generator-driven): reloading sshd does NOTHING here.
+sudo systemctl daemon-reload && sudo systemctl restart ssh.socket
 
-nc -vz <public-ip> <SSH-PORT>     # should time out
-nc -vz 100.x.x.x <SSH-PORT>      # should connect (from tailnet peer)
+# Classic (non-socket) sshd:
+sudo systemctl restart ssh
 ```
+
+Existing sessions survive both — socket-activated connections are separate processes, so
+restarting the socket only changes what is accepted *next*.
+
+**Verify — prove the listener, don't read the config:**
+```bash
+ss -tlnp | grep -E ':<SSH-PORT>'
+# Expect ONLY the overlay addresses. No 0.0.0.0, no [::].
+
+# Empirical check from the box itself — bash's /dev/tcp needs no extra packages:
+timeout 5 bash -c 'exec 3<>/dev/tcp/<OVERLAY-IP>/<SSH-PORT>' && echo "overlay: OPEN" || echo "overlay: closed"
+timeout 5 bash -c 'exec 3<>/dev/tcp/<PUBLIC-IP>/<SSH-PORT>'  && echo "public v4: OPEN (unexpected)" || echo "public v4: closed"
+timeout 5 bash -c 'exec 3<>/dev/tcp/<PUBLIC-IPV6>/<SSH-PORT>' && echo "public v6: OPEN (unexpected)" || echo "public v6: closed"
+```
+
+> **What that actually proves.** Run from the box, these test whether a *socket is bound* to each
+> address — they do **not** test firewall reachability, because traffic to your own address never
+> leaves the host. That is exactly what you want here: binding is the property under test, and a
+> "closed" result means no listener exists on the public IP at all, independent of any firewall.
+> To test the firewall too, connect from an external host.
+
+**Finally, open a NEW session over the overlay and complete a full login before closing the old
+one.** A successful TCP handshake only proves the socket answers; it does not exercise the key +
+TOTP path.
 
 ### 7.7 Remove forgotten / unnecessary services (headless-server blind spots)
 
@@ -858,6 +965,28 @@ EOF
 ```
 
 **Note:** `Automatic-Reboot-WithUsers "true"` means the VPS **will reboot at 04:00 even with active sessions**. Any open `tmux`/`screen` sessions or running scripts will be killed. If you need to prevent this during specific windows, temporarily set it to `"false"` and re-enable afterward.
+
+> **`04:00` in whose timezone?** The **system's** — not yours. Providers commonly image VPSes in
+> their own datacentre region, so a box you administer from another country can sit hours away
+> from your local time. A "quiet 4 AM reboot" then lands in the middle of your working day.
+> ```bash
+> timedatectl                       # the system timezone every scheduled job resolves against
+> date; TZ=<YOUR-TZ> date           # compare system time to yours
+> ```
+> Either set the box to a timezone you reason in (`sudo timedatectl set-timezone <TZ>` — note this
+> shifts *all* log timestamps), or convert deliberately and write the offset in a comment next to
+> every scheduled entry.
+>
+> **`CRON_TZ` will not save you on Debian/Ubuntu.** It is a *cronie* (RHEL-family) extension.
+> Debian/Ubuntu `cron` (3.0pl1) does not implement it, does not warn, and silently runs the job
+> at the system timezone instead — so a crontab that *looks* correctly localised runs hours off.
+> ```bash
+> man 5 crontab | grep -c CRON_TZ   # 0 on Debian/Ubuntu ⇒ unsupported, remove the line
+> ```
+> Verify with reality, not intent: have the job log `date` on each run and check that the recorded
+> times match what you expected. If you genuinely need a fixed wall-clock time in a specific zone
+> regardless of DST, use a systemd timer — `OnCalendar` accepts an explicit timezone
+> (`OnCalendar=*-*-* 03:00:00 <TZ>`, systemd 252+) — rather than cron.
 
 **Verify:**
 ```bash
@@ -1122,11 +1251,61 @@ For each credential found, apply least privilege:
 - **Cloud creds / tokens:** scope to the minimum IAM permissions; rotate; prefer
   short-lived/instance credentials over long-lived static keys where available.
 - **`.env` files:** ensure `chmod 600`, never world-readable, never committed.
+- **Provider "app passwords":** treat as full-account credentials, not scoped ones. A mail-provider
+  app password typically **bypasses the account's MFA by design** (that is its purpose) and grants
+  *read* access to the mailbox, not just send. Since a mailbox receives password-reset links for
+  everything else, a leaked one is an account-takeover primitive. Prefer a transactional provider
+  with a genuinely scoped, send-only API key. If you must use one, know that rotating it means
+  **revoking the old entry** — issuing a new one does not invalidate the old.
+
+**Container environment variables are a credential store — and a readable one.**
+
+Secrets passed to containers via `environment:`/`--env` are stored in plaintext in the container
+config and visible to anyone who can talk to the Docker socket. Membership of the `docker` group
+is root-equivalent (§10), so "only the docker group can read it" is not the reassurance it sounds
+like — and the same values are exposed via `/proc/<pid>/environ` to root.
+
+```bash
+# Inventory WHICH containers carry credential-shaped variables — names only, never values
+for c in $(docker ps --format '{{.Names}}'); do
+  n=$(docker inspect "$c" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+      | grep -icE '^[A-Z_]*(PASS|PASSWD|PASSWORD|SECRET|TOKEN|KEY|CRED|AUTH|DSN)[A-Z_]*=')
+  [ "$n" -gt 0 ] && echo "$c: $n credential-shaped env var(s)"
+done
+```
+
+Prefer file-based secrets (Docker/Swarm secrets, or a mounted `600` file the app reads) over
+environment variables where the application supports it.
+
+> **Convention — print key names, never values.** When auditing or logging secrets, do not try to
+> *redact* values with a pattern; enumerate the keys and print those alone. Redaction lists are a
+> losing game: a filter matching `PASSWORD|KEY|SECRET|TOKEN` silently misses `PASS`, `PWD`,
+> `CRED`, `DSN`, and anything else you did not think of, and one miss writes a live credential
+> into a log, terminal scrollback, or transcript that then has to be treated as compromised.
+> Grep for the *names*, and use `stat`/counts to describe the values.
+
+**Create secrets owner-only, don't fix them afterwards.**
+
+Any script that writes a dump, backup, or key should set `umask 077` *before* creating the file
+rather than `chmod 600`-ing it afterwards. Create-then-chmod leaves a window — often on a default
+`umask 002`, i.e. group-writable — during which the file is readable by others, and the window
+lasts as long as the write takes. Database dumps are the common case: they contain everything the
+database holds.
+
+```bash
+( umask 077
+  pg_dump ... | gzip > "$BACKUP_DIR/dump-$(date +%Y%m%d-%H%M%S).sql.gz" )
+```
+
+Also `chmod 700` the directory itself, and re-check perms periodically — a script that relies on
+the ambient umask will silently start producing world-readable files if it is ever run from a
+different context (cron vs. an interactive shell can differ).
 
 **Verify:**
 ```bash
 ls -la ~/.ssh/                # private keys are 600; you can name what each is for
 grep -E 'Host |IdentityFile' ~/.ssh/config   # every IdentityFile maps to an intended, scoped target
+find <BACKUP-DIR> -type f ! -perm 600        # any backup not owner-only is a finding
 ```
 
 > Real example: this box held `~/.ssh/<key>` that `~/.ssh/config` mapped to

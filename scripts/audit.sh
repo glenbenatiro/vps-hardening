@@ -62,6 +62,20 @@ if command -v docker >/dev/null; then
   echo "--- containers publishing on 0.0.0.0 (each must be justified + allowed at the edge) ---"
   docker ps --format '{{.Names}}: {{.Ports}}' 2>/dev/null | grep -E '0\.0\.0\.0|\[::\]' || echo "(none)"
   echo "--- docker daemon TCP socket (want: none) ---"; ss -tlnp 2>/dev/null | grep -E ':2375|:2376' || echo "(no docker tcp socket - good)"
+  # Credential-shaped env vars in containers. Plaintext in the container config and readable by
+  # anyone who can reach the docker socket - and docker-group membership is root-equivalent.
+  # NAMES AND COUNTS ONLY. Never print values: redaction patterns always miss a case
+  # (PASS vs PASSWORD, PWD, CRED, DSN...) and one miss writes a live secret into this log.
+  echo "--- containers carrying credential-shaped env vars (names only; prefer file-based secrets) ---"
+  _found=0
+  for c in $(docker ps --format '{{.Names}}' 2>/dev/null); do
+    keys=$(docker inspect "$c" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+           | cut -d= -f1 \
+           | grep -iE '(PASS|PASSWD|PASSWORD|SECRET|TOKEN|KEY|CRED|AUTH|DSN)' | sort -u | tr '\n' ' ')
+    if [ -n "$keys" ]; then echo "$c: $keys"; _found=1; fi
+  done
+  if [ "$_found" -eq 0 ]; then echo "(none)"; fi
+  unset _found keys
 else echo "(docker not installed)"; fi
 
 sec "FAIL2BAN"
