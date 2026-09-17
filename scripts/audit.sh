@@ -83,6 +83,7 @@ if command -v fail2ban-client >/dev/null; then
   fail2ban-client status 2>&1
   for j in $(fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:[[:space:]]*//p' | tr ',' ' '); do
     echo "--- jail: $j ---"; fail2ban-client status "$j" 2>&1 | grep -iE 'currently|total|banned|port|file list'
+    fail2ban-client get "$j" journalmatch 2>/dev/null | tail -1 | sed 's/^/  journalmatch: /'
   done
 else echo "(fail2ban not installed)"; fi
 
