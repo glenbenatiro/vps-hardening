@@ -1365,6 +1365,33 @@ sudo fail2ban-client status recidive   # recidive jail running
 
 **Note:** If sshd is invisible to the public (UFW + Tailscale-only from Phase 5), fail2ban will have nothing to ban on sshd — which is exactly right. It still earns its place on any public-facing service (HTTP auth, mail, etc.).
 
+**Note — `Total failed: 0` is not evidence of a broken jail.** On a key-only box (§5.2) the counter legitimately stays at zero: with `PasswordAuthentication no`, scanners are disconnected before they can present a password, so no `Failed password` line is ever written. The stock `sshd` filter in its default mode also ignores `Connection closed by authenticating user` — that pattern fires on ordinary aborted connections too, and only counts under `mode = aggressive`. A quiet counter on a custom port (§5.3) usually means the port is genuinely unattractive to scanners, not that detection is dead.
+
+**Gotcha — the journalmatch looks broken and isn't.** `sudo fail2ban-client get sshd journalmatch` prints:
+
+```
+_SYSTEMD_UNIT=sshd.service + _COMM=sshd
+```
+
+On Ubuntu the SSH unit is `ssh.service` (socket-activated, logging as `ssh.service`), and `sshd.service` may not exist at all — so this reads like a filter that can never match. It matches fine: in systemd journal syntax `+` is **OR**, not AND. The `_COMM=sshd` clause alone catches every sshd event regardless of unit name. Do not "fix" this — the edit is a no-op at best.
+
+**Prove the jail actually fires.** Config inspection cannot distinguish a working jail from a dead one; only a live event can. From a second host — never your only route in — make fewer than `maxretry` rejected logins and watch the counter move:
+
+```bash
+# On the target box — note the starting numbers
+sudo fail2ban-client status sshd | grep -E "Currently failed|Total failed"
+
+# From ANOTHER host: two rejected attempts, safely under maxretry = 5
+for i in 1 2; do
+  ssh -o BatchMode=yes -o ConnectTimeout=6 -p <SSH-PORT> nosuchuser@<TARGET-IP> true
+done
+
+# Back on the target — the counter MUST increase
+sudo fail2ban-client status sshd | grep -E "Currently failed|Total failed"
+```
+
+Stay under `maxretry` so no ban is issued, and run it from a host you can afford to have banned. The counters age out after `findtime`, so there is nothing to undo.
+
 ### 9.2 Audit trail: check who logged in
 
 **What:** Reviewing `last`, `lastb`, and auth.log for unexpected access.
