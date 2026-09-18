@@ -1317,6 +1317,102 @@ find <BACKUP-DIR> -type f ! -perm 600        # any backup not owner-only is a fi
 
 ---
 
+### 8.9 Swap, zswap, and OOM containment
+
+**What:** A swap file, zswap in front of it, and cgroup memory limits on the things most likely to run away.
+
+**Why it protects:** A box with no swap has no graceful degradation — it goes straight from "under memory pressure" to the kernel shooting processes, and the kernel picks badly. A real incident on one of these boxes killed `systemd` and `dbus-daemon`, neither of which had anything to do with the process that exhausted memory. Availability is part of the threat model: a box that OOM-loops is as down as one that was breached.
+
+**How:**
+```bash
+# 1. Swap file. Sizing: this is an OOM cushion, not hibernation space.
+#    8G suits a 4-16G box; on a 32G+ box 4G is plenty, since if you are
+#    routinely 32G deep you have a capacity problem, not a swap problem.
+sudo fallocate -l 8G /swapfile        # ext4. On XFS use dd - fallocate leaves
+sudo chmod 600 /swapfile              # unwritten extents that mkswap rejects.
+sudo mkswap /swapfile
+sudo swapon -p 10 /swapfile           # -p matches the fstab priority below;
+                                      # without it you get the default (-2)
+echo '/swapfile none swap sw,pri=10 0 0' | sudo tee -a /etc/fstab
+
+# 2. zswap - a COMPRESSED CACHE IN FRONT OF SWAP. With no swap device it does
+#    nothing at all, so the swap file above is a prerequisite, not an option.
+#    Runtime (immediate, lost on reboot):
+for p in "zstd compressor" "zsmalloc zpool" "25 max_pool_percent" "1 enabled"; do
+  set -- $p; echo "$1" | sudo tee /sys/module/zswap/parameters/$2 >/dev/null
+done
+#    Persistent (needs a reboot to take effect):
+sudo sed -i 's/^\(GRUB_CMDLINE_LINUX_DEFAULT="[^"]*\)"/\1 zswap.enabled=1 zswap.compressor=zstd zswap.zpool=zsmalloc zswap.max_pool_percent=25"/' /etc/default/grub
+sudo update-grub
+
+# 3. swappiness - TUNE PER WORKLOAD. This is not a one-size setting.
+echo 'vm.swappiness = 100' | sudo tee /etc/sysctl.d/99-swappiness.conf
+sudo sysctl -p /etc/sysctl.d/99-swappiness.conf
+```
+
+**swappiness by workload — do not blanket-apply:**
+
+| Workload | Value | Why |
+|---|---|---|
+| General web / app / DB host | `100` | With zswap, swapping is RAM-speed and compressed. Being aggressive is cheap. |
+| Realtime media (WebRTC, SFU, voice) | `10` | Swapping mid-call means jitter and audio artifacts. Swap should exist as an emergency backstop that is essentially never touched. |
+
+**Verify:**
+```bash
+swapon --show                                  # device, size, PRIO
+cat /sys/module/zswap/parameters/enabled       # Y
+sudo grep -r . /sys/kernel/debug/zswap/        # stored_pages > 0 once it engages
+sysctl vm.swappiness
+```
+
+#### Diagnosing an OOM — attribute the kill before you fix anything
+
+The single most important step, and the one most often skipped. `Killed process … (next-server)` tells you the victim, not where it lived. **`task_memcg` tells you which cgroup it was in, and that decides which layer you fix.**
+
+```bash
+# Fast: -k limits to the kernel ring, --grep filters inside journald.
+# A client-side `journalctl | grep` over a busy journal will time out.
+sudo journalctl -k --since "14 days ago" \
+  --grep "Out of memory|oom_reaper|Killed process" --no-pager | tail -20
+
+# Count victims by name
+sudo journalctl -k --since "14 days ago" --grep "Out of memory" --no-pager \
+  | grep -oE 'Killed process [0-9]+ \(([^)]+)\)' \
+  | sed 's/.*(\(.*\))/\1/' | sort | uniq -c | sort -rn
+```
+
+Read the cgroup on each kill:
+
+| `task_memcg` contains | The offender lived in | Fix at |
+|---|---|---|
+| `/system.slice/docker-<id>.scope` | a container | `mem_limit` on that service (§10.11) |
+| `/user.slice/user-<uid>.slice/...` | an interactive login — tmux, VS Code Server, a dev server | a limit on the **user slice** (below) |
+| `constraint=CONSTRAINT_NONE … global_oom` | nothing hit its own cap; the **whole box** ran out | both, plus swap |
+
+Getting this backwards wastes the fix. On one box here every large kill was `tmux-spawn-….scope` under `user.slice` — dev servers left running, not the production containers. Container limits would not have prevented a single one of them.
+
+#### Limiting the user slice
+
+On any box where someone logs in to work — VS Code Server, tmux, language servers, browser automation — that activity is uncapped by default and can OOM-kill production alongside it.
+
+```bash
+sudo systemctl set-property user-$(id -u).slice MemoryHigh=5G MemoryMax=7G
+```
+
+`MemoryHigh` throttles and reclaims under pressure; `MemoryMax` is the hard ceiling where the kernel kills **inside the slice**. Production containers never feel it.
+
+Set `MemoryHigh` **above current usage** or you throttle from the moment it applies:
+
+```bash
+systemctl show user-$(id -u).slice -p MemoryCurrent -p MemoryHigh -p MemoryMax
+```
+
+Budget so that `user slice max + container totals + ~1G host` stays under physical RAM.
+
+**Note — the real fix is often workflow, not config.** If a production host is also someone's development workstation, the editor, its extensions, npx packages and agent tooling all run as the user that owns the production secrets and deploy keys. Limits contain the memory symptom; they do nothing about that.
+
+---
+
 ## 9. Phase 7 — Intrusion detection & monitoring
 
 *Set up detection and visibility. At this point your VPS is well protected; this phase surfaces anything that slips through.*
@@ -1864,6 +1960,34 @@ meant to be embedded.
 curl -sI https://app.example.com | grep -iE 'strict-transport|x-frame|x-content-type'
 # expect: strict-transport-security, x-frame-options: DENY, x-content-type-options: nosniff
 ```
+
+---
+
+### 10.11 Container memory limits
+
+**What:** A cgroup memory ceiling per service.
+
+**Why it protects:** An unlimited container can consume all host RAM. When it does, the kernel OOM-killer chooses a victim globally and frequently picks something unrelated — the box loses a service that was behaving. A limit turns "the host falls over" into "one container restarts".
+
+**How:**
+```yaml
+services:
+  app:
+    mem_limit: 3g          # hard ceiling; container is killed at this point
+    mem_reservation: 1g    # soft target, reclaimed under pressure
+    restart: unless-stopped
+```
+
+**How to pick a number:** watch real peaks first, then set the limit **above** the true working set. A limit below it kills a container doing legitimate work, which is worse than no limit.
+
+```bash
+docker stats --no-stream --format '{{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}'
+docker inspect <name> --format '{{.Name}} {{.HostConfig.Memory}}'   # 0 = unlimited
+```
+
+**Verify:** no service reports `0`, and the sum of limits plus host overhead stays under physical RAM.
+
+**Scope — this only helps for in-container offenders.** Check `task_memcg` on the actual OOM records first (§8.9). If the kills are under `user.slice`, limits here change nothing; cap the user slice instead.
 
 ---
 
