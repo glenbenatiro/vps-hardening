@@ -1,0 +1,13 @@
+# Output of scripts/audit.sh.
+#
+# audit.sh writes to "${SCRIPT_DIR:-.}/security-audit-<host>-<ts>.log", so these land
+# next to the script (or in the cwd) and show up as untracked files in `git status` --
+# which is exactly how one gets committed by reflex.
+#
+# They are a full security posture dump of a live host: every listening socket, the
+# sudoers file including NOPASSWD grants, authorized_keys owners, SSH login sources and
+# brute-force origins, container env var NAMES, and unencrypted-private-key locations.
+# That is a map of how to attack the box. This repo is public. Never commit one.
+#
+# No leading slash, so this matches at any depth.
+security-audit-*.log
