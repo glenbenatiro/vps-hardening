@@ -138,7 +138,7 @@ sec "SSH outbound reach (blast radius - what this box's keys can log in to)"
 for h in /root /home/*; do cfg="$h/.ssh/config"; [ -f "$cfg" ] && { echo "# $cfg"; grep -E '^\s*(Host|IdentityFile) ' "$cfg"; }; done
 
 sec "SECRETS AT REST - group/other-readable .env or key files (PERMS only, not contents)"
-find /home /srv /root -maxdepth 5 \( -name '.env' -o -name '.env.*' -o -name '*.pem' -o -name '*.key' -o -name 'credentials*.json' -o -name 'service-account*.json' \) ! -name '*.example' -not -path '*/node_modules/*' -perm /044 -exec stat -c '%a %U:%G %n' {} \; 2>/dev/null | head -40
+find /home /srv /root -maxdepth 5 \( -name '.env' -o -name '.env.*' -o -name '*.pem' -o -name '*.key' -o -name 'credentials*.json' -o -name 'service-account*.json' \) ! -name '*.example' -type f -not -path '*/node_modules/*' -perm /044 -exec stat -c '%a %U:%G %n' {} \; 2>/dev/null | head -40
 echo "(only group/other-readable ones are listed; empty list = good)"
 
 sec "FORGOTTEN SERVICES (headless-server blind spots)"
