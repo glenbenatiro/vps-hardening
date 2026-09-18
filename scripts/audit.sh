@@ -49,9 +49,53 @@ grep -rniE 'ListenStream|^\s*Port' /etc/systemd/system/ssh.socket.d/ /etc/ssh/ss
 sec "HOST FIREWALL (UFW)"
 ufw status verbose 2>&1
 
-sec "DOCKER-USER iptables chain (on-box Docker firewall rule, if any)"
-iptables -S DOCKER-USER 2>/dev/null || echo "(no DOCKER-USER chain / iptables unavailable)"
+sec "DOCKER-USER iptables chain (the ONLY thing that governs container ports - see HARDENING.md 10.12)"
+for _ipt in iptables ip6tables; do
+  echo "--- $_ipt ---"
+  $_ipt -S DOCKER-USER 2>/dev/null || { echo "(no DOCKER-USER chain / $_ipt unavailable)"; continue; }
+  $_ipt -S DU-INBOUND 2>/dev/null | sed 's/^/    /'
+done
+
+# UFW's INPUT rules never see container traffic: Docker DNATs in nat PREROUTING, so the packet is
+# FORWARDed, and FORWARD jumps to DOCKER-USER/DOCKER-FORWARD before any ufw-*-forward chain.
+# An empty DOCKER-USER while containers publish publicly is therefore a real hole, not a style nit.
+_pub=0
+if command -v docker >/dev/null 2>&1; then
+  docker ps --format '{{.Ports}}' 2>/dev/null | grep -qE '0\.0\.0\.0|\[::\]' && _pub=1
+fi
+# Count real rules, not a specific implementation: an inline default-deny and a sub-chain jump
+# are both valid. What matters is that SOMETHING terminates in DROP on the container path.
+_rules=$(iptables -S DOCKER-USER 2>/dev/null | grep -c '^-A' || true)
+_drop=$( { iptables -S DOCKER-USER 2>/dev/null; iptables -S DU-INBOUND 2>/dev/null; } | grep -c -- '-j DROP' || true)
+if [ "$_pub" -eq 1 ] && [ "${_rules:-0}" -eq 0 ]; then
+  echo "FINDING: containers publish on 0.0.0.0/[::] but DOCKER-USER is EMPTY."
+  echo "         UFW does NOT cover these ports. Any published port is reachable from the internet"
+  echo "         unless an edge firewall happens to block it. See HARDENING.md 10.12."
+elif [ "$_pub" -eq 1 ] && [ "${_drop:-0}" -eq 0 ]; then
+  echo "FINDING: DOCKER-USER has rules but nothing terminates in DROP - it is not a default-deny."
+else
+  echo "OK: DOCKER-USER default-deny present, or no publicly published container ports."
+fi
+
+# --dport matches the CONTAINER port (post-DNAT), not the published one. A rule written that way
+# silently allows -p <anyport>:80 and silently blocks a proxy published as 80:8000.
+if { iptables -S DOCKER-USER 2>/dev/null; iptables -S DU-INBOUND 2>/dev/null; } | grep -q -- '--dport'; then
+  echo "FINDING: DOCKER-USER/DU-INBOUND matches on --dport. After DNAT that is the CONTAINER port, not the"
+  echo "         published one. Use --ctorigdstport instead. See HARDENING.md 10.12."
+fi
+
+# ufw_start()/ufw_stop() flush AND delete every non-builtin filter chain when this is yes,
+# which destroys DOCKER-USER, every DOCKER-* chain and DU-INBOUND.
+if grep -qE '^MANAGE_BUILTINS=yes' /etc/default/ufw 2>/dev/null; then
+  echo "FINDING: MANAGE_BUILTINS=yes in /etc/default/ufw - a ufw reload will DELETE the Docker chains."
+fi
+unset _pub _rules _drop _ipt
+
 echo "NOTE: a cloud/provider firewall is edge/panel-side and is NOT visible here. Verify it separately."
+echo "NOTE: IPv6 - with no v6 DNAT and forwarding=0, [::] published ports are served by the userland"
+echo "      docker-proxy via INPUT and are governed by UFW, not DOCKER-USER. Check before asserting:"
+echo "      forwarding=$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo '?')" \
+     "v6_nat_rules=$(ip6tables -t nat -S DOCKER 2>/dev/null | grep -c '^-A')"
 
 sec "ALL LISTENING SOCKETS (interpret: public 0.0.0.0/[::] vs loopback vs tailscale)"
 ss -tulnp 2>/dev/null
