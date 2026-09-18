@@ -1991,6 +1991,199 @@ docker inspect <name> --format '{{.Name}} {{.HostConfig.Memory}}'   # 0 = unlimi
 
 ---
 
+### 10.12 UFW does not govern container ports — use DOCKER-USER
+
+This is the single most common false-assurance trap on a Docker host. `ufw status` reports
+`Default: deny (incoming)` while every published container port is wide open, with no error and
+no log line.
+
+**Why.** Docker publishes a port with a DNAT rule in `nat PREROUTING`:
+
+```
+-A DOCKER ! -i br-xxxx -p tcp --dport 443 -j DNAT --to-destination 172.18.0.2:443
+```
+
+`PREROUTING` runs **before** the routing decision. Once the destination has been rewritten to the
+container's address, the kernel concludes the packet is not for this host and sends it down
+**FORWARD**. UFW's rules live in **INPUT**. They never meet.
+
+It gets worse: Docker installs its own jumps *above* UFW's, so even UFW's forward chains are
+too late.
+
+```
+-P FORWARD DROP
+-A FORWARD -j DOCKER-USER        <- 1st: yours
+-A FORWARD -j DOCKER-FORWARD     <- 2nd: Docker ACCEPTs published ports here
+-A FORWARD -j ufw-before-forward <- 3rd: never reached for those packets
+```
+
+`DOCKER-USER` is Docker's documented hook: the one chain it creates but never populates or
+rewrites. On a stock host it is empty, i.e. a no-op.
+
+#### The rule that looks right and is wrong
+
+**Do not match on `--dport`.** By the time a packet reaches `DOCKER-USER`, DNAT has already
+rewritten the destination port to the **container** port. `--dport` therefore matches the
+container port, not the published one. Two consequences, both verified live:
+
+* `docker run -p 7881:80 nginx` is **allowed** by a `--dport 80,443` rule. Measured on a live
+  box: three requests to `:7881` incremented the `80,443` counter and the `DROP` rule stayed at
+  zero.
+* Where the proxy publishes `80:8000` and `443:8443` (common when Traefik runs as non-root on
+  high ports), a `--dport 80,443` rule sees `8000`/`8443` and **drops all web traffic**.
+
+Match the pre-NAT destination instead:
+
+```
+-m conntrack --ctstate NEW --ctorigdstport 80 -j RETURN
+```
+
+`--ctorigdstport` is the original destination port — the published host port, which is what
+"open port 443" actually means. It accepts one port or range, so emit one rule per port.
+
+#### Use a sub-chain you own
+
+`DOCKER-USER` can have more than one manager (an egress allowlist, a provider agent). Never
+`-F DOCKER-USER`, and never delete by positional index parsed from `iptables -S`: the index is
+computed from one snapshot and used in a later write, so a concurrent change makes you delete
+someone else's rule. Silently, exit 0.
+
+Put every rule in a dedicated chain and enter it with a single jump. Cleanup is then `-F`/`-X`
+on a chain nobody else touches, which cannot harm another manager by construction.
+
+```sh
+#!/bin/sh
+set -eu
+WAN="${WAN:-eth0}"; SUB="DU-INBOUND"; TAG="du-inbound"; W="-w 10"
+TCP_PORTS="${TCP_PORTS:-80,443}"; UDP_PORTS="${UDP_PORTS:-}"
+
+add_ports() {   # $1=iptables|ip6tables  $2=tcp|udp  $3=comma list
+  _ipt="$1"; _proto="$2"; _list="$3"
+  [ -z "$_list" ] && return 0
+  for _p in $(echo "$_list" | tr ',' ' '); do
+    $_ipt $W -A "$SUB" -i "$WAN" -p "$_proto" -m conntrack --ctstate NEW \
+          --ctorigdstport "$_p" -m comment --comment "$TAG" -j RETURN
+  done
+}
+
+apply() {
+  IPT="$1"
+  $IPT $W -S DOCKER-USER >/dev/null 2>&1 || { echo "WARNING: no DOCKER-USER (FAIL-OPEN)" >&2; return 0; }
+  $IPT $W -N "$SUB" 2>/dev/null || true
+  $IPT $W -F "$SUB"
+  $IPT $W -A "$SUB" -i "$WAN" -m conntrack --ctstate ESTABLISHED,RELATED \
+        -m comment --comment "$TAG" -j RETURN
+  [ "$IPT" = ip6tables ] && $IPT $W -A "$SUB" -i "$WAN" -p icmpv6 \
+        -m comment --comment "$TAG" -j RETURN
+  add_ports "$IPT" tcp "$TCP_PORTS"
+  add_ports "$IPT" udp "$UDP_PORTS"
+  $IPT $W -A "$SUB" -i "$WAN" -m comment --comment "$TAG" -j DROP
+  $IPT $W -C DOCKER-USER -m comment --comment "$TAG" -j "$SUB" 2>/dev/null \
+    || $IPT $W -I DOCKER-USER 1 -m comment --comment "$TAG" -j "$SUB"
+  $IPT $W -C "$SUB" -i "$WAN" -m comment --comment "$TAG" -j DROP   # assert, or fail the unit
+  $IPT $W -C DOCKER-USER -m comment --comment "$TAG" -j "$SUB"
+}
+```
+
+Details that matter:
+
+* **`-i eth0` scoping** keeps loopback-published ports, bridge traffic and any overlay interface
+  out of scope. Loopback publishes DNAT with `-d 127.0.0.1/32` and can never match it.
+* **`RETURN`, never `ACCEPT`.** `ACCEPT` terminates FORWARD traversal and bypasses
+  `DOCKER-FORWARD`'s per-container rules and inter-network isolation. `RETURN` resumes at the
+  next `FORWARD` rule.
+* **`ESTABLISHED,RELATED` first.** This is what keeps every outbound-initiated flow working, and
+  it is why a default-deny here does not sever normal operation. It also carries ICMP errors:
+  conntrack parses the embedded header and marks `fragmentation-needed` / `packet-too-big`
+  `RELATED`, so path-MTU discovery survives.
+* **UDP needs an explicit `NEW` allow.** Browser-initiated media (WebRTC) arrives inbound first;
+  `ESTABLISHED,RELATED` does not cover it.
+* **`-w 10` on every call.** The unit fires right after dockerd programs its own rules, the most
+  contended moment for `/run/xtables.lock`. Without `-w`, a lock failure is the trigger for every
+  other failure mode.
+
+#### Persistence
+
+There is no `iptables-persistent` on a stock Ubuntu box, so these rules die on reboot unless a
+unit re-applies them. A `oneshot` with `Requires=`/`After=docker.service` is sufficient —
+`Requires=` already carries restart propagation, so `PartOf=` adds nothing.
+
+```ini
+[Unit]
+Description=Apply DOCKER-USER firewall hardening (DU-INBOUND)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/docker-user-firewall.sh on
+ExecStop=/usr/local/sbin/docker-user-firewall.sh off
+TimeoutStartSec=60
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
+```
+
+* **Always set `TimeoutStartSec`.** `Type=oneshot` defaults to `infinity`. A script that wedges
+  leaves the unit in `activating` forever, so `multi-user.target` never activates and **the boot
+  hangs** — with the chain still empty, i.e. fail-open.
+* **`ExecStop=` is not optional.** With `RemainAfterExit=yes` and no `ExecStop`,
+  `systemctl stop` removes *zero* rules; it only flips bookkeeping. Without it you have no
+  rollback.
+* **Never assert `systemctl is-active`.** A script that skips a missing chain exits 0, so the
+  unit reports `active` with nothing installed. Assert the rules and the jump:
+  `docker-user-firewall.sh status`.
+* An internal `Restart=always` revival of dockerd is not a restart *job* and re-runs nothing.
+  Docker does not flush `DOCKER-USER` on restart, so rules survive — but verify rather than assume.
+
+#### IPv6: know what you are actually protecting
+
+If no Docker network has `enable_ipv6`, there is no v6 DNAT and `net.ipv6.conf.all.forwarding=0`.
+A `[::]` published port is then served by the userland **`docker-proxy` host process**, so that
+traffic is delivered locally, traverses **INPUT**, and is governed by **UFW** — not by
+`DOCKER-USER`. Install the v6 rules anyway as future-proofing, but do not claim they are
+enforcing anything until a Docker network enables IPv6. Check before asserting:
+
+```sh
+sysctl net.ipv6.conf.all.forwarding
+ip6tables -t nat -S DOCKER
+docker network inspect <net> --format '{{.EnableIPv6}}'
+```
+
+#### UFW is one setting away from deleting all of this
+
+`/lib/ufw/ufw-init-functions::flush_builtins()` runs `iptables -F` **and `-X`** across every
+non-builtin chain in the filter table — which would destroy `DOCKER-USER`, every `DOCKER-*`
+chain and your sub-chain. It is gated on `MANAGE_BUILTINS` in `/etc/default/ufw`, `no` by
+default. **Never set it to `yes` on a Docker host.** Note also that `ufw_stop()` sets
+`-P FORWARD ACCEPT` transiently during a reload, which is why the sub-chain must end in an
+explicit `-j DROP` rather than relying on chain policy.
+
+#### Verifying it actually works
+
+A negative control is the only real proof, and it must use a port your **edge/provider firewall
+allows** — otherwise the edge blocks the probe and you learn nothing about the host:
+
+```sh
+docker run -d --rm --name fwtest -p <edge-allowed-port>:80 nginx:alpine
+# from off-box, before applying: must SUCCEED   (this is the gap)
+# from off-box, after  applying: must FAIL      (this is the fix)
+docker rm -f fwtest
+```
+
+Then confirm the `DROP` counter moved (`iptables -L DU-INBOUND -n -v`) and that every legitimate
+service still answers. A `DROP` counter that stays at zero while the probe succeeds means your
+rule is matching the wrong thing — most likely `--dport` instead of `--ctorigdstport`.
+
+#### Per-box UFW tables should differ
+
+Do not "standardise" UFW across a fleet. A box whose SSH is bound to an overlay interface should
+scope its SSH rule to that interface; a box carrying media ports needs them and the others must
+not. Mirroring a fleet to one table widens the surface on every box that did not need the extra
+ports. Document *why* each differs instead.
+
 ## 11. Post-hardening verification checklist
 
 For a thorough **read-only** audit that writes a log you (or Claude Code) can grade against this playbook,
